@@ -954,6 +954,14 @@ export function recheckItemPriceAndStock(db, { itemId, newPrice, newInStock = tr
   const oldPrice = item.price;
   const oldInStock = item.in_stock;
 
+  // Items that pre-date price tracking have no starting point; record the
+  // price they had so the history (and any drop) is measured from it.
+  const hasHistory = db.prepare('SELECT 1 FROM price_snapshots WHERE item_id = ? LIMIT 1').get(item.id);
+  if (!hasHistory && oldPrice !== null) {
+    db.prepare('INSERT INTO price_snapshots (id, item_id, price, in_stock, checked_at) VALUES (?, ?, ?, ?, ?)').run(
+      uid('ps'), item.id, oldPrice, oldInStock, item.created_at
+    );
+  }
   db.prepare('INSERT INTO price_snapshots (id, item_id, price, in_stock, checked_at) VALUES (?, ?, ?, ?, ?)').run(
     uid('ps'), item.id, parsedPrice, inStockFlag, nowIso
   );

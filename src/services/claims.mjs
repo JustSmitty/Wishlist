@@ -557,6 +557,11 @@ export function handleOwnerEditItem(db, { itemId, ownerId, updates }) {
     );
 
     if (newPrice !== item.price && newPrice !== null) {
+      const hasHistory = db.prepare('SELECT 1 FROM price_snapshots WHERE item_id = ? LIMIT 1').get(item.id);
+      if (!hasHistory && item.price !== null) {
+        db.prepare('INSERT INTO price_snapshots (id, item_id, price, in_stock, checked_at) VALUES (?, ?, ?, ?, ?)')
+          .run(uid('ps'), item.id, item.price, item.in_stock, item.created_at);
+      }
       db.prepare('INSERT INTO price_snapshots (id, item_id, price, in_stock, checked_at) VALUES (?, ?, ?, ?, ?)')
         .run(uid('ps'), item.id, newPrice, item.in_stock, nowIso);
     }

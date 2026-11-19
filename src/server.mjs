@@ -798,10 +798,15 @@ export function createApp(customDb = null, options = {}) {
       ));
       const actor = { claimId, actorId: currentUser?.id || null, manageToken: guestToken };
 
-      if (b.action === 'click_out' || b.action === 'answer_return_prompt') {
+      if (['click_out', 'answer_return_prompt', 'set_note'].includes(b.action)) {
         // Same response for "no such claim" and "not yours".
         if (!isOwn) throw notFound('Reservation not found');
         const nowIso = new Date().toISOString();
+        if (b.action === 'set_note') {
+          db.prepare('UPDATE claims SET order_note = ?, updated_at = ? WHERE id = ?')
+            .run(cleanText(b.order_note, 500) || null, nowIso, claimId);
+          return sendJson(res, 200, { claim: publicClaim(db.prepare('SELECT * FROM claims WHERE id = ?').get(claimId)) });
+        }
         if (b.action === 'click_out') {
           db.prepare('UPDATE claims SET clicked_out_at = ?, updated_at = ? WHERE id = ?').run(nowIso, nowIso, claimId);
           return sendJson(res, 200, { clicked_out_at: nowIso });

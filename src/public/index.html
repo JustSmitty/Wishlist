@@ -1,54 +1,35 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="robots" content="noindex, nofollow" />
-  <meta name="theme-color" content="#3730a3" />
-  <title>Hushlist — Universal Wishlist (Zero Spoilers, Any Store)</title>
+  <meta name="color-scheme" content="light dark" />
+  <meta name="theme-color" content="#fbf6ec" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#17131f" media="(prefers-color-scheme: dark)" />
+  <meta name="description" content="Wishlists for any store that keep the surprise." />
+  <title>Hushlist</title>
   <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="icon" href="/icons/icon.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="/icons/icon-192.png" />
+  <link rel="preload" href="/fonts/fraunces-latin.woff2" as="font" type="font/woff2" crossorigin />
   <link rel="stylesheet" href="/styles.css" />
+  <script src="/js/theme.js"></script>
 </head>
 <body>
-  <header class="top-header" role="banner">
-    <div class="header-inner">
-      <div class="brand">
-        <div class="brand-logo" aria-hidden="true">H</div>
-        <div>
-          <h1 class="brand-title">Hushlist</h1>
-          <p class="brand-tagline">Every wish, any store — zero spoilers &amp; zero exposed addresses</p>
-        </div>
-      </div>
-
-      <div style="display:flex; flex-wrap:wrap; align-items:center; gap:0.75rem;">
-        <div class="persona-switcher">
-          <label for="persona-select">Viewing As:</label>
-          <select id="persona-select" aria-label="Switch active persona or Guest view"></select>
-        </div>
-        <button id="btn-quick-signup" class="btn btn-secondary btn-sm" type="button">+ Invite / Join</button>
-      </div>
+  <a class="skip-link" href="#view">Skip to content</a>
+  <div id="app" class="app" aria-busy="true">
+    <div class="boot">
+      <svg class="boot__seal" viewBox="0 0 64 64" width="64" height="64" aria-hidden="true">
+        <circle cx="32" cy="32" r="28" fill="currentColor"/>
+        <path d="M21 34c0-9 5-15 11-15s11 6 11 15M27 40h10" fill="none" stroke="#fffdf8" stroke-width="3" stroke-linecap="round"/>
+      </svg>
+      <p>Unwrapping Hushlist…</p>
+      <noscript><p>Hushlist needs JavaScript to run.</p></noscript>
     </div>
-  </header>
-
-  <nav class="nav-bar" aria-label="Primary navigation">
-    <div class="nav-inner">
-      <button class="nav-tab active" data-tab="my-lists" type="button">My Wishlists &amp; Kids</button>
-      <button class="nav-tab" data-tab="dashboard" type="button">People I Shop For</button>
-      <button class="nav-tab" data-tab="my-claims" type="button">My Claims Tracker</button>
-      <button class="nav-tab" data-tab="shared-giver" type="button">Giver / Shared Link View</button>
-      <button class="nav-tab" data-tab="groups" type="button">Family Groups &amp; Secret Santa</button>
-      <button class="nav-tab" data-tab="inbox" type="button">Notification Inbox</button>
-      <button class="nav-tab" data-tab="admin" type="button">Admin &amp; Capture Config</button>
-    </div>
-  </nav>
-
-  <main class="container" id="app-root" role="main">
-    <p>Loading Hushlist...</p>
-  </main>
-
-  <div id="modal-root"></div>
-  <div id="toast-root" class="toast-container" aria-live="polite"></div>
-
-  <script type="module" src="/app.js"></script>
+  </div>
+  <div id="dialog-root"></div>
+  <div id="toast-root" class="toasts" role="status" aria-live="polite"></div>
+  <script type="module" src="/js/main.js"></script>
 </body>
 </html>

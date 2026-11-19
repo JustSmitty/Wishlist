@@ -265,3 +265,21 @@ test('import: editors only, capped, duplicates skipped, bad rows reported withou
   assert.throws(() => importAmazonList(db, { listId: 'lst_maya_bday', canEdit, itemsPayload: items }), /cannot add/);
   assert.throws(() => importAmazonList(db, { listId: 'lst_justin_holiday', canEdit, itemsPayload: new Array(201).fill({ title: 'x' }) }), /at most 200/);
 });
+
+test('a price update on an item with no history records where it started, so the drop is visible', async () => {
+  const app = await startApp();
+  try {
+    const maya = await app.as('usr_maya');
+    assert.equal(app.db.prepare("SELECT COUNT(*) AS n FROM price_snapshots WHERE item_id = 'itm_m2'").get().n, 0);
+    const res = await maya.post('/api/items/itm_m2/recheck', { new_price: 54, in_stock: true });
+    assert.equal(res.json.recheck.drop_percent, 20.6);
+    assert.equal(res.json.recheck.significant_drop_alert, true);
+    const item = (await maya.get('/api/lists/lst_maya_bday')).json.list.items.find(i => i.id === 'itm_m2');
+    assert.deepEqual(item.price_history.map(p => p.price), [68, 54]);
+    assert.equal(item.price_drop_percent, 20.6);
+    // The giver who reserved it hears about the drop; the owner's response said nothing about them.
+    const justin = await app.as('usr_justin');
+    assert.ok((await justin.get('/api/notifications')).json.notifications.some(n => n.event_type === 'claimed_item_price_drop'));
+    assert.equal((await maya.post('/api/items/itm_m2/recheck', { new_price: 'free' })).status, 400);
+  } finally { await app.close(); }
+});
