@@ -41,7 +41,8 @@ export function publicSelf(user) {
     is_dependent: Boolean(user.is_dependent),
     is_admin: Boolean(user.is_admin),
     follow_approval_required: Boolean(user.follow_approval_required),
-    time_zone: user.time_zone || null
+    time_zone: user.time_zone || null,
+    google_connected: Boolean(user.google_sub)
   };
 }
 
@@ -166,64 +167,76 @@ export function completeSignIn(db, { challengeId, code, profile = null, adminEma
   }
 
   return inTransaction(db, () => {
-    let user = db.prepare('SELECT * FROM users WHERE LOWER(email) = ?').get(challenge.email);
-    let created = false;
-
-    if (user && user.status !== 'active') {
-      throw forbidden('This account is not available');
-    }
-
-    if (!user) {
-      const name = cleanText(profile?.name, 80);
-      if (!name) return { needs_profile: true };
-
-      const userId = uid('usr');
-      const month = intInRange(profile?.birthday_month, 1, 12);
-      const day = month ? intInRange(profile?.birthday_day, 1, daysInMonth(month)) : null;
-      db.prepare(`
-        INSERT INTO users (id, name, email, birthday_month, birthday_day, is_dependent, is_admin, status, created_at)
-        VALUES (?, ?, ?, ?, ?, 0, ?, 'active', ?)
-      `).run(userId, name, challenge.email, month, month ? day : null, adminEmails.has(challenge.email) ? 1 : 0, nowIso);
-
-      db.prepare(`
-        INSERT INTO lists (id, owner_id, name, occasion, visibility, surprise_mode, share_token, created_at)
-        VALUES (?, ?, ?, 'Birthday', 'link', 1, ?, ?)
-      `).run(uid('lst'), userId, `${name}'s wishlist`, secretToken('shr'), nowIso);
-
-      // Blocks placed on this address before an earlier account was closed
-      // apply to the new account too.
-      reapplyBlocksForEmail(db, userId, challenge.email);
-
-      user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
-      created = true;
-    } else if (adminEmails.size > 0 && Boolean(user.is_admin) !== adminEmails.has(challenge.email)) {
-      // HUSHLIST_ADMIN_EMAILS is the source of truth whenever it is set:
-      // adding an address grants the role, removing it takes the role away.
-      db.prepare('UPDATE users SET is_admin = ? WHERE id = ?').run(adminEmails.has(challenge.email) ? 1 : 0, user.id);
-      user = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
-    }
-
-    // Reservations this person made as a guest with the same, confirmed,
-    // address become theirs. Both times they proved they read that mailbox,
-    // so nothing depends on a token left behind in whichever browser they used.
-    // (Not on lists they own: an owner never holds claims on their own list.)
-    const asGuest = db.prepare(`
-      SELECT id FROM claims
-      WHERE claimer_user_id IS NULL AND verified = 1 AND LOWER(guest_email) = ?
-        AND list_id NOT IN (SELECT id FROM lists WHERE owner_id = ? OR co_owner_ids LIKE ?)
-    `).all(challenge.email, user.id, `%"${user.id}"%`);
-    for (const c of asGuest) {
-      db.prepare('UPDATE claims SET claimer_user_id = ?, guest_email = NULL, guest_name = NULL, manage_token = ?, updated_at = ? WHERE id = ?')
-        .run(user.id, secretToken('mng'), nowIso, c.id);
-    }
-
-    let joinedGroup = null;
-    const inviteCode = cleanText(profile?.invite_code, 64);
-    if (inviteCode) joinedGroup = joinGroupByInvite(db, user.id, inviteCode, { quiet: true });
-
-    db.prepare('UPDATE auth_challenges SET consumed_at = ? WHERE id = ?').run(nowIso, challenge.id);
-    return { user, created, joined_group: joinedGroup };
+    const result = signInVerifiedEmail(db, { email: challenge.email, profile, adminEmails });
+    if (!result.needs_profile) db.prepare('UPDATE auth_challenges SET consumed_at = ? WHERE id = ?').run(nowIso, challenge.id);
+    return result;
   });
+}
+
+/**
+ * Signs in the person who has just proved they control `email` (by a code
+ * sent to it, or because Google vouches for it). Existing address → that
+ * account. New address → { needs_profile: true } until a name is supplied,
+ * then a new account with a first list. Must run inside a transaction.
+ */
+export function signInVerifiedEmail(db, { email, profile = null, adminEmails = new Set(), googleSub = null }) {
+  const nowIso = new Date().toISOString();
+  let user = db.prepare('SELECT * FROM users WHERE LOWER(email) = ?').get(email);
+  let created = false;
+
+  if (user && user.status !== 'active') {
+    throw forbidden('This account is not available');
+  }
+
+  if (!user) {
+    const name = cleanText(profile?.name, 80);
+    if (!name) return { needs_profile: true };
+
+    const userId = uid('usr');
+    const month = intInRange(profile?.birthday_month, 1, 12);
+    const day = month ? intInRange(profile?.birthday_day, 1, daysInMonth(month)) : null;
+    db.prepare(`
+      INSERT INTO users (id, name, email, birthday_month, birthday_day, is_dependent, is_admin, status, created_at, google_sub)
+      VALUES (?, ?, ?, ?, ?, 0, ?, 'active', ?, ?)
+    `).run(userId, name, email, month, month ? day : null, adminEmails.has(email) ? 1 : 0, nowIso, googleSub);
+
+    db.prepare(`
+      INSERT INTO lists (id, owner_id, name, occasion, visibility, surprise_mode, share_token, created_at)
+      VALUES (?, ?, ?, 'Birthday', 'link', 1, ?, ?)
+    `).run(uid('lst'), userId, `${name}'s wishlist`, secretToken('shr'), nowIso);
+
+    // Blocks placed on this address before an earlier account was closed
+    // apply to the new account too.
+    reapplyBlocksForEmail(db, userId, email);
+
+    user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
+    created = true;
+  } else if (adminEmails.size > 0 && Boolean(user.is_admin) !== adminEmails.has(email)) {
+    // HUSHLIST_ADMIN_EMAILS is the source of truth whenever it is set:
+    // adding an address grants the role, removing it takes the role away.
+    db.prepare('UPDATE users SET is_admin = ? WHERE id = ?').run(adminEmails.has(email) ? 1 : 0, user.id);
+    user = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
+  }
+
+  // Reservations this person made as a guest with the same, confirmed,
+  // address become theirs. Both times they proved they read that mailbox,
+  // so nothing depends on a token left behind in whichever browser they used.
+  // (Not on lists they own: an owner never holds claims on their own list.)
+  const asGuest = db.prepare(`
+    SELECT id FROM claims
+    WHERE claimer_user_id IS NULL AND verified = 1 AND LOWER(guest_email) = ?
+      AND list_id NOT IN (SELECT id FROM lists WHERE owner_id = ? OR co_owner_ids LIKE ?)
+  `).all(email, user.id, `%"${user.id}"%`);
+  for (const c of asGuest) {
+    db.prepare('UPDATE claims SET claimer_user_id = ?, guest_email = NULL, guest_name = NULL, manage_token = ?, updated_at = ? WHERE id = ?')
+      .run(user.id, secretToken('mng'), nowIso, c.id);
+  }
+
+  let joinedGroup = null;
+  const inviteCode = cleanText(profile?.invite_code, 64);
+  if (inviteCode) joinedGroup = joinGroupByInvite(db, user.id, inviteCode, { quiet: true });
+
+  return { user, created, joined_group: joinedGroup };
 }
 
 /**

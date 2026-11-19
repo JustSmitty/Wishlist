@@ -4,17 +4,20 @@
  * Invariant: nothing addressed to the owner or a co-owner of an unrevealed
  * surprise-mode list may reveal whether an item on that list is claimed.
  *
- * Delivery: this build has no email provider. Messages are written to
- * notifications_outbox and delivered by dispatchOutbox(), which the server
- * runs after each request and on a timer. That keeps delivery outside the
- * database transaction that produced the message (nothing is sent for work
- * that was rolled back) and is what makes "send later" real: a message held
- * for quiet hours is sent when its time comes. In demo mode the outbox is
- * shown in the app; otherwise the default transport prints to the server
- * log. Wire a real provider in with setMailTransport().
+ * Delivery: messages are written to notifications_outbox and delivered by
+ * dispatchOutbox(), which the server runs after each request and on a timer.
+ * That keeps delivery outside the database transaction that produced the
+ * message (nothing is sent for work that was rolled back) and is what makes
+ * "send later" real: a message held for quiet hours is sent when its time
+ * comes. A failed delivery is retried with growing gaps and given up on after
+ * eight tries, three days, or a permanent refusal from the mail server.
+ *
+ * Transports: SMTP (any provider), the server log, or none (demo mode, where
+ * the outbox is shown in the app). A transport may be synchronous or async.
  *
  * The one exception is a message carrying a one-time code. Its real text is
- * never stored, so it is handed to the transport immediately.
+ * never stored, so it is handed to the transport straight away; if that
+ * fails the person asks for a new code.
  */
 
 import { uid } from '../db/schema.mjs';
@@ -44,10 +47,14 @@ const SPOILER_EVENT_TYPES = new Set([
 
 let mailTransport = null;
 
-/** fn({ to, subject, body, eventType }) — called once per message that is due now. */
+/** fn({ to, subject, body, eventType }) — called once per message that is due now; may return a promise. */
 export function setMailTransport(fn) {
   mailTransport = typeof fn === 'function' ? fn : null;
 }
+
+const RETRY_MINUTES = [1, 5, 15, 60, 180, 360, 720];
+const MAX_ATTEMPTS = RETRY_MINUTES.length + 1;
+let dispatching = null;
 
 export function consoleMailTransport({ to, subject, body }) {
   // Addresses and text come from people; control characters must not reach
@@ -159,11 +166,11 @@ export function sendNotification(db, {
   );
 
   if (immediate && mailTransport) {
-    try {
-      mailTransport({ to: recipientEmail, subject, body, eventType });
-    } catch (err) {
-      console.error('[mail] transport failed:', err.message);
-    }
+    const transport = mailTransport;
+    // Not awaited: the person is waiting for the page, not for the mail server.
+    Promise.resolve()
+      .then(() => transport({ to: recipientEmail, subject, body, eventType }))
+      .catch(err => console.error(`[mail] could not send ${eventType}:`, err.message));
   }
 
   return { id, sent: dueNow, transactional: isTransactional, scheduled_for: scheduledFor.toISOString() };
@@ -171,25 +178,42 @@ export function sendNotification(db, {
 
 /**
  * Delivers every stored message whose time has come. Safe to call often: it
- * is one indexed query when there is nothing to do. A message that fails is
- * left for the next run, and given up on after three days.
+ * is one indexed query when there is nothing to do, and a call made while a
+ * delivery run is in progress waits for that run instead of starting another
+ * (which could send the same message twice). Resolves to the number sent.
  */
 export function dispatchOutbox(db, now = new Date()) {
+  if (dispatching) return dispatching.then(() => 0);
+  dispatching = runDispatch(db, now).finally(() => { dispatching = null; });
+  return dispatching;
+}
+
+async function runDispatch(db, now) {
   const nowIso = now.toISOString();
   const giveUpBefore = new Date(now.getTime() - 3 * 86400 * 1000).toISOString();
   const due = db.prepare(`
-    SELECT id, recipient_email, event_type, subject, body FROM notifications_outbox
-    WHERE sent_at IS NULL AND scheduled_for <= ? AND scheduled_for > ?
-    ORDER BY scheduled_for ASC LIMIT 200
-  `).all(nowIso, giveUpBefore);
+    SELECT id, recipient_email, event_type, subject, body, attempts FROM notifications_outbox
+    WHERE sent_at IS NULL AND failed_at IS NULL AND scheduled_for <= ? AND scheduled_for > ?
+      AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+    ORDER BY scheduled_for ASC LIMIT 100
+  `).all(nowIso, giveUpBefore, nowIso);
   let sent = 0;
   for (const row of due) {
+    // Checked again just before sending: the row may have been removed (an
+    // account closed) while earlier messages in this run were being sent.
+    if (!db.prepare('SELECT 1 FROM notifications_outbox WHERE id = ? AND sent_at IS NULL').get(row.id)) continue;
+    const transport = mailTransport;
     try {
-      if (mailTransport) mailTransport({ to: row.recipient_email, subject: row.subject, body: row.body, eventType: row.event_type });
-      db.prepare('UPDATE notifications_outbox SET sent_at = ? WHERE id = ?').run(nowIso, row.id);
+      if (transport) await transport({ to: row.recipient_email, subject: row.subject, body: row.body, eventType: row.event_type });
+      db.prepare('UPDATE notifications_outbox SET sent_at = ?, last_error = NULL WHERE id = ?').run(new Date().toISOString(), row.id);
       sent++;
     } catch (err) {
-      console.error('[mail] transport failed:', err.message);
+      const attempts = (row.attempts || 0) + 1;
+      const giveUp = Boolean(err?.permanent) || attempts >= MAX_ATTEMPTS;
+      const retryAt = new Date(now.getTime() + RETRY_MINUTES[Math.min(attempts - 1, RETRY_MINUTES.length - 1)] * 60_000).toISOString();
+      db.prepare('UPDATE notifications_outbox SET attempts = ?, next_attempt_at = ?, failed_at = ?, last_error = ? WHERE id = ?')
+        .run(attempts, giveUp ? null : retryAt, giveUp ? new Date().toISOString() : null, String(err?.message || err).slice(0, 300), row.id);
+      console.error(`[mail] delivery ${giveUp ? 'given up' : 'will be retried'} (${row.event_type}):`, err?.message || err);
     }
   }
   return sent;

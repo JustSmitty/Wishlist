@@ -50,6 +50,29 @@ function runMigrations(db) {
   if (!cols('notifications_outbox').has('about_user_id')) {
     db.exec('ALTER TABLE notifications_outbox ADD COLUMN about_user_id TEXT;');
   }
+  // The Google account (OpenID "sub") linked to this person, if any.
+  if (!cols('users').has('google_sub')) {
+    db.exec('ALTER TABLE users ADD COLUMN google_sub TEXT;');
+  }
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub) WHERE google_sub IS NOT NULL;');
+  // One row per Google sign-in in progress: what the browser must bring back.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS oauth_states (
+      state_hash TEXT PRIMARY KEY,
+      browser_hash TEXT NOT NULL,
+      code_verifier TEXT NOT NULL,
+      nonce TEXT NOT NULL,
+      return_to TEXT NOT NULL DEFAULT '/',
+      link_user_id TEXT,
+      invite_code TEXT,
+      created_at TEXT NOT NULL,
+      used_at TEXT
+    );
+  `);
+  // Delivery bookkeeping: retries with back-off, and a final give-up.
+  for (const [name, type] of [['attempts', 'INTEGER NOT NULL DEFAULT 0'], ['next_attempt_at', 'TEXT'], ['failed_at', 'TEXT'], ['last_error', 'TEXT']]) {
+    if (!cols('notifications_outbox').has(name)) db.exec(`ALTER TABLE notifications_outbox ADD COLUMN ${name} ${type};`);
+  }
   // IANA zone reported by the person's browser; used for quiet hours only.
   if (!cols('users').has('time_zone')) {
     db.exec('ALTER TABLE users ADD COLUMN time_zone TEXT;');

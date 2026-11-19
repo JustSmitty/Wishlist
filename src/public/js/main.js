@@ -13,7 +13,7 @@ import gifts from './views/gifts.js';
 import circles from './views/circles.js';
 import inbox from './views/inbox.js';
 import admin from './views/admin.js';
-import welcome, { brandMark } from './views/welcome.js';
+import welcome, { brandMark, G_LOGO } from './views/welcome.js';
 
 const NAV = [
   ['/', 'home', 'My lists', 'list'],
@@ -151,6 +151,15 @@ on('account', () => {
       </div>
       <div id="token-box" aria-live="polite"></div>
 
+      ${store.session.auth?.google ? html`
+        <hr />
+        <h3>Google account</h3>
+        ${me().google_connected
+          ? html`<p class="small muted">You can sign in with Google. Disconnecting leaves your account as it is; you can still sign in with an email code.</p>
+              <button class="btn btn--sm" type="button" data-action="google-disconnect">Disconnect Google</button>`
+          : html`<p class="small muted">Connect a Google account to sign in without waiting for a code.</p>
+              <a class="btn btn--sm btn--google" href="/api/auth/google/start?link=1">${G_LOGO}<span>Connect Google</span></a>`}` : ''}
+
       <hr />
       <h3>Your data</h3>
       <div class="row hero__actions">
@@ -281,6 +290,11 @@ async function boot() {
   const sharedUrl = params.get('sharedUrl');
   await navigate(currentAddress(), { replace: true });
 
+  if (params.get('google') === 'connected' && me()) {
+    history.replaceState(null, '', location.pathname);
+    toast('Google account connected. You can now sign in with Google.');
+  }
+
   // Arrived from the share sheet or the bookmarklet: open "Add a wish" prefilled.
   if (sharedUrl !== null && me()) {
     history.replaceState(null, '', '/');
@@ -291,6 +305,18 @@ async function boot() {
 
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
 }
+
+on('google-disconnect', async () => {
+  const ok = await confirmSheet({
+    title: 'Disconnect Google?',
+    message: 'You will sign in with an email code instead. You can connect Google again at any time.',
+    confirmLabel: 'Disconnect'
+  });
+  if (!ok) return;
+  await del('/api/auth/google');
+  await loadSession();
+  toast('Google account disconnected');
+});
 
 on('reload', () => location.reload());
 window.addEventListener('unhandledrejection', (event) => { reportError(event.reason); });

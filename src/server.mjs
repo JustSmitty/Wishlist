@@ -23,9 +23,13 @@ import {
   sendNotification, generateFollowerDigest, setMailTransport, consoleMailTransport, dispatchOutbox, isValidTimeZone
 } from './services/notifications.mjs';
 import { createSecretSantaExchange } from './services/secret-santa.mjs';
+import { createSmtpTransport } from './services/smtp.mjs';
+import {
+  GOOGLE, beginGoogleSignIn, completeGoogleSignIn, googleIsAuthoritative, GoogleSignInError
+} from './services/google.mjs';
 import {
   publicSelf, createSession, resolveSession, destroySession, revokeApiTokens, countApiTokens,
-  startSignIn, completeSignIn, joinGroupByInvite, syncAdmins, purgeExpiredAuth
+  startSignIn, completeSignIn, joinGroupByInvite, syncAdmins, purgeExpiredAuth, signInVerifiedEmail
 } from './services/auth.mjs';
 import { deleteAccount } from './services/account.mjs';
 import {
@@ -75,7 +79,10 @@ export function createApp(customDb = null, options = {}) {
 
   seedRetailerAdapters(db);
   if (config.demoMode) seedDemoData(db);
-  setMailTransport(config.mailTransport === 'console' ? consoleMailTransport : null);
+  // A test may hand in its own transport function.
+  setMailTransport(typeof config.mailTransport === 'function' ? config.mailTransport
+    : config.mailTransport === 'smtp' ? createSmtpTransport(config.smtp)
+    : config.mailTransport === 'console' ? consoleMailTransport : null);
   syncAdmins(db, config.adminEmails);
 
   const limiter = new RateLimiter();
@@ -88,7 +95,7 @@ export function createApp(customDb = null, options = {}) {
     try {
       purgeExpiredClaims(db);
       purgeExpiredAuth(db);
-      dispatchOutbox(db);
+      dispatchOutbox(db).catch(err => console.error('[hushlist] mail dispatch failed:', err));
     } catch (err) {
       console.error('[hushlist] housekeeping failed:', err);
     }
@@ -276,6 +283,7 @@ export function createApp(customDb = null, options = {}) {
         is_guest: !currentUser,
         dependents,
         api_tokens: currentUser ? countApiTokens(db, currentUser.id) : 0,
+        auth: { google: Boolean(config.google) },
         demo: { enabled: config.demoMode, personas }
       });
     }
@@ -313,6 +321,90 @@ export function createApp(customDb = null, options = {}) {
         created: result.created,
         joined_group: result.joined_group
       }, { 'Set-Cookie': sessionCookie(session.token, session.maxAgeSeconds, { secure: config.secureCookies }) });
+    }
+
+    // ----- Sign in with Google ---------------------------------------------
+    const googleCookie = (value, maxAge) => [
+      `hl_oauth=${value}`, 'Path=/api/auth/google', 'HttpOnly', 'SameSite=Lax', `Max-Age=${maxAge}`,
+      ...(config.secureCookies ? ['Secure'] : [])
+    ].join('; ');
+    const redirect = (location, cookies = []) => {
+      res.writeHead(302, { Location: location, 'Cache-Control': 'no-store', ...(cookies.length ? { 'Set-Cookie': cookies } : {}) });
+      res.end();
+    };
+
+    if (pathname === '/api/auth/google/start' && method === 'GET') {
+      if (!config.google) throw notFound('Not found');
+      limit(req, 'google-start', 20);
+      const link = urlObj.searchParams.get('link') === '1';
+      // Connecting Google to an existing account needs that account's session.
+      if (link && !cookieSession) return redirect('/welcome?signin_error=signed_out');
+      const started = beginGoogleSignIn(db, config.google, {
+        returnTo: link ? '/?account=1' : (urlObj.searchParams.get('return') || '/'),
+        linkUserId: link ? currentUser.id : null,
+        inviteCode: cleanText(urlObj.searchParams.get('invite'), 64) || null,
+        endpoints: config.googleEndpoints || GOOGLE
+      });
+      return redirect(started.url, [googleCookie(started.browserSecret, started.maxAgeSeconds)]);
+    }
+
+    if (pathname === '/api/auth/google/callback' && method === 'GET') {
+      if (!config.google) throw notFound('Not found');
+      limit(req, 'google-callback', 20);
+      const clearState = googleCookie('', 0);
+      const browserSecret = parseCookies(req.headers.cookie).hl_oauth || null;
+      let outcome;
+      try {
+        const { claims, state } = await completeGoogleSignIn(db, config.google, {
+          query: urlObj.searchParams, browserSecret,
+          endpoints: config.googleEndpoints || GOOGLE,
+          fetchImpl: config.googleFetch || fetch
+        });
+        outcome = inTransaction(db, () => {
+          const bySub = db.prepare('SELECT * FROM users WHERE google_sub = ?').get(claims.sub);
+          if (state.link_user_id) {
+            const owner = getActiveUser(db, state.link_user_id);
+            if (!owner) throw new GoogleSignInError('signed_out', 'Sign in again');
+            if (bySub && bySub.id !== owner.id) throw new GoogleSignInError('linked_elsewhere', 'That Google account is connected to another Hushlist account');
+            db.prepare('UPDATE users SET google_sub = ? WHERE id = ?').run(claims.sub, owner.id);
+            return { user: owner, returnTo: state.return_to, linked: true };
+          }
+          if (bySub) {
+            if (bySub.status !== 'active' || bySub.is_dependent) throw new GoogleSignInError('unavailable', 'This account is not available');
+            return { user: bySub, returnTo: state.return_to };
+          }
+          if (!googleIsAuthoritative(claims)) throw new GoogleSignInError('use_code', 'Sign in with an email code first');
+          const email = String(claims.email).toLowerCase();
+          const existing = db.prepare('SELECT google_sub FROM users WHERE LOWER(email) = ?').get(email);
+          if (existing?.google_sub && existing.google_sub !== claims.sub) {
+            throw new GoogleSignInError('linked_elsewhere', 'This Hushlist account is connected to a different Google account');
+          }
+          const name = cleanText(claims.name, 80) || cleanText(claims.given_name, 80) || cleanText(email.split('@')[0], 80) || 'New member';
+          const result = signInVerifiedEmail(db, {
+            email, adminEmails: config.adminEmails, googleSub: claims.sub,
+            profile: { name, invite_code: state.invite_code }
+          });
+          if (!result.created) db.prepare('UPDATE users SET google_sub = ? WHERE id = ?').run(claims.sub, result.user.id);
+          return { user: result.user, returnTo: state.return_to, created: result.created };
+        });
+      } catch (err) {
+        const code = err instanceof GoogleSignInError ? err.code : 'google_error';
+        if (!(err instanceof GoogleSignInError)) console.error('[google] sign-in failed:', err);
+        return redirect(`/welcome?signin_error=${encodeURIComponent(code)}`, [clearState]);
+      }
+      if (outcome.linked) return redirect('/?google=connected', [clearState]);
+      if (cookieToken) destroySession(db, cookieToken);
+      const session = createSession(db, outcome.user.id);
+      return redirect(outcome.returnTo || '/', [
+        clearState,
+        sessionCookie(session.token, session.maxAgeSeconds, { secure: config.secureCookies })
+      ]);
+    }
+
+    if (pathname === '/api/auth/google' && method === 'DELETE') {
+      const user = requireUser();
+      db.prepare('UPDATE users SET google_sub = NULL WHERE id = ?').run(user.id);
+      return sendJson(res, 200, { current_user: publicSelf(getActiveUser(db, user.id)) });
     }
 
     if (pathname === '/api/auth/demo-login' && method === 'POST') {
@@ -1823,7 +1915,7 @@ export function createApp(customDb = null, options = {}) {
     // Mail is delivered here, after the work that produced it has been
     // committed (or rolled back, in which case there is nothing to send).
     if (req.url && req.url.startsWith('/api/')) {
-      try { dispatchOutbox(db); } catch (err) { console.error('[hushlist] mail dispatch failed:', err); }
+      dispatchOutbox(db).catch(err => console.error('[hushlist] mail dispatch failed:', err));
     }
   }
 
@@ -2150,8 +2242,12 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(__filename
   server.listen(config.port, config.host, () => {
     const shown = config.host === '0.0.0.0' ? 'localhost' : config.host;
     console.log(`Hushlist is running at http://${shown}:${config.port}`);
-    console.log(config.demoMode
-      ? 'Demo mode: sample family loaded, one-click sign-in enabled, reachable from this machine only. Set HUSHLIST_DEMO=0 to turn it off.'
-      : 'Demo mode is off. Sign-in codes are written to this log until an email provider is configured.');
+    if (config.demoMode) {
+      console.log('Demo mode: sample family loaded, one-click sign-in enabled, reachable from this machine only. Set HUSHLIST_DEMO=0 to turn it off.');
+    } else {
+      console.log(`Mail: ${config.mailTransport === 'smtp' ? `SMTP via ${config.smtp.host}:${config.smtp.port}` : config.mailTransport === 'console'
+        ? 'written to this log (no email provider configured: people cannot receive sign-in codes)' : 'not sent'}.`);
+      console.log(`Google sign-in: ${config.google ? 'on' : 'off'}.`);
+    }
   });
 }

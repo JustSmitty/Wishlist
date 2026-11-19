@@ -333,7 +333,7 @@ test('administrators: the configured list decides, and nothing about their own s
   } finally { await app.close(); }
 });
 
-test('mail: held for quiet hours on the recipient\'s own clock and then actually sent; a digest never repeats itself', () => {
+test('mail: held for quiet hours on the recipient\'s own clock and then actually sent; a digest never repeats itself', async () => {
   const db = testDb();
   const sent = [];
   setMailTransport((m) => sent.push(m));
@@ -342,9 +342,9 @@ test('mail: held for quiet hours on the recipient\'s own clock and then actually
     const plain = sendNotification(db, { recipientUserId: 'usr_elena', eventType: 'new_follower', subject: 'a', body: 'b' });
     assert.equal(plain.sent, true);
     assert.equal(sent.length, 0, 'nothing leaves before the work is committed');
-    assert.equal(dispatchOutbox(db), 1);
+    assert.equal(await dispatchOutbox(db), 1);
     assert.equal(sent.length, 1);
-    assert.equal(dispatchOutbox(db), 0, 'and it is sent once');
+    assert.equal(await dispatchOutbox(db), 0, 'and it is sent once');
 
     // A zone where it is the middle of the night right now, including a half-hour zone.
     const zones = ['Asia/Kolkata', 'Asia/Kathmandu', 'America/Los_Angeles', 'Europe/London', 'Asia/Tokyo'];
@@ -354,8 +354,8 @@ test('mail: held for quiet hours on the recipient\'s own clock and then actually
     db.prepare("UPDATE users SET time_zone = ? WHERE id = 'usr_arthur'").run(asleep);
     const held = sendNotification(db, { recipientUserId: 'usr_arthur', eventType: 'new_follower', subject: 'night', body: 'b' });
     assert.equal(held.sent, false);
-    assert.equal(dispatchOutbox(db), 0);
-    assert.equal(dispatchOutbox(db, new Date(new Date(held.scheduled_for).getTime() + 1000)), 1, 'sent when quiet hours end');
+    assert.equal(await dispatchOutbox(db), 0);
+    assert.equal(await dispatchOutbox(db, new Date(new Date(held.scheduled_for).getTime() + 1000)), 1, 'sent when quiet hours end');
     assert.equal(sent.at(-1).subject, 'night');
     const wakeHour = Number(new Intl.DateTimeFormat('en-US', { hour: 'numeric', hourCycle: 'h23', timeZone: asleep }).format(new Date(held.scheduled_for)));
     const wakeMinute = Number(new Intl.DateTimeFormat('en-US', { minute: 'numeric', timeZone: asleep }).format(new Date(held.scheduled_for)));

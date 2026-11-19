@@ -152,7 +152,7 @@ function erasePerson(db, userId) {
   db.prepare(`
     UPDATE users
     SET name = 'Deleted user', email = NULL, avatar_url = NULL, birthday_month = NULL, birthday_day = NULL,
-        is_admin = 0, status = 'deleted', auth_credential_id = NULL, time_zone = NULL
+        is_admin = 0, status = 'deleted', auth_credential_id = NULL, time_zone = NULL, google_sub = NULL
     WHERE id = ?
   `).run(userId);
 }
