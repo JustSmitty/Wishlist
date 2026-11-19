@@ -14,7 +14,8 @@
  *   follower  someone the list is shared with, in the owner's circle, or an
  *             approved follower. Sees claims; sees giver names only if in the circle.
  *   guest     anyone else holding the link (signed in or not). Sees only
- *             "available / taken" plus their own claim.
+ *             whether an item is still available and how many are left, plus
+ *             their own claim. No other reservation, pledge or amount.
  */
 
 import {
@@ -42,7 +43,8 @@ export function getViewerRole(db, list, viewerUserId = null, guestClaimToken = n
 
   if (viewerUserId && (list.owner_id === viewerUserId || coOwners.includes(viewerUserId))) {
     // A guardian named as co-owner of their child's list is still a giver.
-    if (owner.is_dependent === 1 && list.owner_id !== viewerUserId) return guardianRole;
+    // A co-owner who is not a guardian is an owner like any other.
+    if (owner.is_dependent === 1 && isGuardianOf(db, viewerUserId, list.owner_id)) return guardianRole;
     const visible = ownerCanSeeClaims(list);
     return {
       role: 'owner', canView: true, canEdit: true,
@@ -53,10 +55,7 @@ export function getViewerRole(db, list, viewerUserId = null, guestClaimToken = n
   if (viewerUserId && isGuardianOf(db, viewerUserId, list.owner_id)) return guardianRole;
 
   if (viewerUserId) {
-    const listBlocked = db.prepare(
-      "SELECT 1 FROM follows WHERE follower_id = ? AND target_type = 'list' AND target_id = ? AND status = 'blocked'"
-    ).get(viewerUserId, list.id);
-    if (listBlocked || isBlockedBy(db, viewerUserId, list.owner_id)) {
+    if (isBlockedBy(db, viewerUserId, list.owner_id)) {
       return { role: 'blocked', canView: false };
     }
 
@@ -174,8 +173,9 @@ export function sanitizeItemForViewer(db, item, list, viewerCtx, viewerUserId = 
     FROM claims c
     LEFT JOIN users u ON u.id = c.claimer_user_id
     WHERE c.item_id = ? AND c.status IN ('reserved', 'purchased', 'given') AND c.verified = 1
+      AND (c.status != 'reserved' OR c.expires_at IS NULL OR c.expires_at > ?)
     ORDER BY c.created_at ASC
-  `).all(item.id);
+  `).all(item.id, new Date().toISOString());
 
   const contributions = db.prepare(`
     SELECT c.*, u.name AS user_name
@@ -230,6 +230,21 @@ export function sanitizeItemForViewer(db, item, list, viewerCtx, viewerUserId = 
       contributor_display: canSeeName ? (c.user_name || c.guest_name || 'A contributor') : 'Someone'
     };
   });
+
+  // Someone who only holds the link learns what they need to choose a gift
+  // and nothing about anyone else's: no rows for other people's reservations,
+  // no pledges, no amounts.
+  if (viewerCtx.role === 'guest') {
+    return {
+      ...baseItem,
+      claim_summary: {
+        qty_remaining: baseItem.always_wanted ? null : Math.max(0, baseItem.qty_wanted - qtyClaimed),
+        is_fully_claimed: isFullyClaimed,
+        claims: sanitizedClaims.filter(c => c.is_own_claim),
+        contributions: []
+      }
+    };
+  }
 
   return {
     ...baseItem,

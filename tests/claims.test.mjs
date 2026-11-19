@@ -3,9 +3,11 @@ import assert from 'node:assert/strict';
 import { startApp, testDb } from './helpers.mjs';
 import {
   createClaim, verifyGuestClaim, transitionClaimState, handleOwnerEditItem, handleOwnerDeleteOrGotIt,
-  purgeExpiredClaims, addContribution, normalizeEmailForCap
+  purgeExpiredClaims, addContribution, normalizeEmailForCap, markItemReceived, archiveList
 } from '../src/services/claims.mjs';
 import { createSecretSantaExchange } from '../src/services/secret-santa.mjs';
+import { blockUser } from '../src/services/access.mjs';
+import { deleteAccount } from '../src/services/account.mjs';
 import { importAmazonList } from '../src/services/capture.mjs';
 
 test('the last unit goes to exactly one giver', () => {
@@ -73,9 +75,9 @@ test('guest claims: nothing is held, and nothing is disclosed, until the code is
     const hijack = await app.guest.withHeaders({ 'X-Guest-Token': seedToken }).patch('/api/claims/clm_elena_on_justin', { status: 'released' });
     assert.equal(hijack.status, 403);
 
-    // Another guest sees "taken", no name, no id.
-    const other = (await app.guest.get('/api/lists/justin-winter-2026')).json.list.items.find(i => i.id === 'itm_j1').claim_summary.claims[0];
-    assert.deepEqual([other.status, other.claimer_display, other.id], ['taken', 'Someone', undefined]);
+    // Another guest sees that it is taken and nothing about who or how.
+    const other = (await app.guest.get('/api/lists/justin-winter-2026')).json.list.items.find(i => i.id === 'itm_j1').claim_summary;
+    assert.deepEqual(other, { qty_remaining: 0, is_fully_claimed: true, claims: [], contributions: [] });
   } finally { await app.close(); }
 });
 
@@ -103,12 +105,36 @@ test('guest cap: aliases count as one person, "given" still counts, pending requ
   hold('itm_j4', 'sybil@googlemail.com');
   // Advancing a claim to "given" does not free a slot.
   db.prepare("UPDATE claims SET status = 'given' WHERE id = ?").run(first.id);
-  assert.throws(() => createClaim(db, { itemId: 'itm_j4', guestEmail: 'sy.bil+9@gmail.com' }), /up to 3 items/);
+  // The cap is applied when the code is entered. Asking is answered the same
+  // way whatever the address already holds, so a link holder cannot use the
+  // request to find out who has reserved on a list.
+  const fourth = createClaim(db, { itemId: 'itm_j4', guestEmail: 'sy.bil+9@gmail.com' });
+  const fresh = createClaim(db, { itemId: 'itm_j4', guestEmail: 'nobody-yet@example.com' });
+  assert.deepEqual(Object.keys(fourth).sort(), Object.keys(fresh).sort());
+  assert.equal(fourth.status, 'pending_verification');
+  assert.throws(() => verifyGuestClaim(db, { claimId: fourth.id, code: fourth.verification_code }), /up to 3 items/);
+  assert.equal(db.prepare('SELECT status FROM claims WHERE id = ?').get(fourth.id).status, 'released');
 
-  // An attacker filing unverified requests under someone's address only evicts their own stale ones.
-  for (let i = 0; i < 6; i++) createClaim(db, { itemId: 'itm_m3', guestEmail: `Victim+${i}@example.com` });
+  // The cap counts units, and is checked again for every code entered.
+  const a = createClaim(db, { itemId: 'itm_j4', guestEmail: 'queue@example.com', qty: 2 });
+  const b = createClaim(db, { itemId: 'itm_j4', guestEmail: 'queue@example.com', qty: 2 });
+  verifyGuestClaim(db, { claimId: a.id, code: a.verification_code });
+  assert.throws(() => verifyGuestClaim(db, { claimId: b.id, code: b.verification_code }), /up to 3 items/);
+
+  // Someone who reserved as a guest and then signs up is still the same person.
+  db.prepare("INSERT INTO users (id, name, email, created_at) VALUES ('usr_sybil', 'Sybil', 'sybil@gmail.com', ?)").run(new Date().toISOString());
+  assert.throws(() => createClaim(db, { itemId: 'itm_j4', claimerUserId: 'usr_sybil' }), /up to 3 items/);
+
+  // Unverified requests are never cancelled by later ones: nobody can make
+  // the real owner of an address lose a reservation they are confirming.
   const real = createClaim(db, { itemId: 'itm_m3', guestEmail: 'victim@example.com' });
-  assert.equal(real.status, 'pending_verification');
+  for (let i = 0; i < 6; i++) createClaim(db, { itemId: 'itm_m3', guestEmail: `Victim+${i}@example.com` });
+  assert.equal(verifyGuestClaim(db, { claimId: real.id, code: real.verification_code }).status, 'reserved');
+
+  // A code entered after the list was closed or taken off link sharing holds nothing.
+  const late = createClaim(db, { itemId: 'itm_m3', guestEmail: 'late@example.com' });
+  db.prepare("UPDATE lists SET visibility = 'private' WHERE id = 'lst_maya_bday'").run();
+  assert.throws(() => verifyGuestClaim(db, { claimId: late.id, code: late.verification_code }), /no longer available/);
 });
 
 test('state machine: only real transitions, only by the claimer; helpers and guardians can release and nothing else', async () => {
@@ -126,9 +152,10 @@ test('state machine: only real transitions, only by the claimer; helpers and gua
   // Maya is helper on Justin's list.
   assert.throws(() => move('given', 'usr_maya', { orderNote: 'rewritten' }), /only release/);
   assert.throws(() => move('released', 'usr_elena'), /cannot change/);
+  db.prepare("UPDATE claims SET order_note = 'Order #4471, hidden in the garage' WHERE id = ?").run(c.id);
   const released = move('released', 'usr_maya', { orderNote: 'rewritten', reason: 'Duplicate' });
-  assert.equal(released.status, 'released');
-  assert.equal(released.order_note, null, "a helper cannot rewrite the giver's note");
+  assert.deepEqual(released, { id: c.id, status: 'released' }, "a helper is told it was released, never the giver's note");
+  assert.equal(db.prepare('SELECT order_note FROM claims WHERE id = ?').get(c.id).order_note, 'Order #4471, hidden in the garage', "and cannot rewrite it");
   assert.equal(db.prepare("SELECT COUNT(*) AS n FROM notifications_outbox WHERE recipient_user_id = 'usr_arthur' AND event_type = 'claimed_item_changed'").get().n, 1);
   assert.throws(() => move('purchased'), /closed/);
   assert.throws(() => move('released'), /closed/);
@@ -137,6 +164,64 @@ test('state machine: only real transitions, only by the claimer; helpers and gua
   const stale = createClaim(db, { itemId: 'itm_j1', claimerUserId: 'usr_elena' });
   db.prepare('UPDATE claims SET expires_at = ? WHERE id = ?').run('2020-01-01T00:00:00.000Z', stale.id);
   assert.throws(() => transitionClaimState(db, { claimId: stale.id, newState: 'purchased', actorId: 'usr_elena' }), /closed/);
+
+  // A helper the owner has blocked can no longer release anything.
+  const held = createClaim(db, { itemId: 'itm_j1', claimerUserId: 'usr_arthur' });
+  blockUser(db, 'usr_justin', 'usr_maya');
+  assert.throws(() => transitionClaimState(db, { claimId: held.id, newState: 'released', actorId: 'usr_maya' }), /cannot change/);
+
+  // Undoing "bought" makes a new hold: full period, and only while there is room and the list is open.
+  const undo = (id) => transitionClaimState(db, { claimId: id, newState: 'reserved', actorId: 'usr_arthur' });
+  transitionClaimState(db, { claimId: held.id, newState: 'purchased', actorId: 'usr_arthur' });
+  db.prepare("UPDATE claims SET expires_at = '2020-01-01T00:00:00.000Z', expiry_warned = 1 WHERE id = ?").run(held.id);
+  const again = undo(held.id);
+  assert.ok(again.expires_at > new Date().toISOString(), 'the hold period starts again');
+  assert.equal(db.prepare('SELECT expiry_warned FROM claims WHERE id = ?').get(held.id).expiry_warned, 0);
+  transitionClaimState(db, { claimId: held.id, newState: 'purchased', actorId: 'usr_arthur' });
+  db.prepare("UPDATE lists SET archived_at = ? WHERE id = 'lst_justin_holiday'").run(new Date().toISOString());
+  assert.throws(() => undo(held.id), /no longer open/);
+});
+
+test('received, archived and edited items: every giver ends up with the truth, once', () => {
+  const db = testDb();
+  const count = (userId, like) => db.prepare('SELECT COUNT(*) AS n FROM notifications_outbox WHERE recipient_user_id = ? AND subject LIKE ?').get(userId, like).n;
+  const status = (id) => db.prepare('SELECT status FROM claims WHERE id = ?').get(id).status;
+
+  // Marked received: a gift recorded as bought is given; a hold that was never bought is cancelled, not "given".
+  const bought = createClaim(db, { itemId: 'itm_j4', claimerUserId: 'usr_elena' });
+  transitionClaimState(db, { claimId: bought.id, newState: 'purchased', actorId: 'usr_elena' });
+  const onlyHeld = createClaim(db, { itemId: 'itm_j4', claimerUserId: 'usr_arthur' });
+  const pending = createClaim(db, { itemId: 'itm_j4', guestEmail: 'unverified@example.com' });
+  markItemReceived(db, { itemId: 'itm_j4', actorId: 'usr_justin' });
+  assert.deepEqual([status(bought.id), status(onlyHeld.id), status(pending.id)], ['given', 'withdrawn', 'withdrawn']);
+  assert.equal(count('usr_arthur', '%no longer needed%'), 1);
+
+  // Title, link and price edits reach the people giving the item.
+  const c = createClaim(db, { itemId: 'itm_j1', claimerUserId: 'usr_elena' });
+  handleOwnerEditItem(db, { itemId: 'itm_j1', ownerId: 'usr_justin', updates: { title: 'Kettle, the big one', price: 250 } });
+  const mail = db.prepare("SELECT body FROM notifications_outbox WHERE recipient_user_id = 'usr_elena' AND subject LIKE '%Kettle, the big one%'").get().body;
+  assert.match(mail, /Name:.*Kettle, the big one/);
+  assert.match(mail, /Price: 195\.00 USD → 250\.00 USD/);
+
+  // Switching chip-in off cancels the pledges and says so.
+  handleOwnerEditItem(db, { itemId: 'itm_m1', ownerId: 'usr_maya', updates: { allow_group_chip_in: false } });
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM contributions WHERE item_id = 'itm_m1' AND status = 'pledged'").get().n, 0);
+  assert.equal(count('usr_justin', '%switched off%'), 1);
+
+  // Archiving: one message per person however many holds they had; none to an address nobody confirmed.
+  createClaim(db, { itemId: 'itm_j3', guestEmail: 'never-confirmed@example.com' });
+  const second = createClaim(db, { itemId: 'itm_j3', claimerUserId: 'usr_elena' });
+  const before = db.prepare("SELECT COUNT(*) AS n FROM notifications_outbox WHERE recipient_email = 'never-confirmed@example.com' AND event_type != 'guest_verification_code'").get().n;
+  archiveList(db, db.prepare("SELECT * FROM lists WHERE id = 'lst_justin_holiday'").get());
+  assert.deepEqual([status(c.id), status(second.id)], ['released', 'released']);
+  assert.equal(count('usr_elena', '%was closed%'), 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM notifications_outbox WHERE recipient_email = 'never-confirmed@example.com' AND event_type != 'guest_verification_code'").get().n, before);
+
+  // A one-day hold does not get a "48 hours left" warning the moment it is made.
+  const shortHold = createClaim(db, { itemId: 'itm_m3', claimerUserId: 'usr_arthur' });
+  db.prepare('UPDATE claims SET expires_at = ? WHERE id = ?').run(new Date(Date.now() + 24 * 3600 * 1000).toISOString(), shortHold.id);
+  purgeExpiredClaims(db);
+  assert.equal(count('usr_arthur', '%ends in%'), 0);
 });
 
 test('owner edits: notes diff reaches the giver, lowering quantity or ending "always wanted" releases newest holds first', () => {
@@ -206,43 +291,97 @@ test('chip-in: members only, needs a price, capped at what is still needed, can 
     const db = app.db;
     db.prepare("UPDATE items SET price = NULL, allow_group_chip_in = 1 WHERE id = 'itm_e1'").run();
     assert.throws(() => addContribution(db, { itemId: 'itm_e1', contributorUserId: 'usr_justin', pledgedAmount: 10 }), /needs a price/);
+
+    // Chipping in is for people the owner has a connection with: a stranger
+    // holding the link cannot mark gifts as funded.
+    const mallory = await app.signUp('mallory@example.com', 'Mallory');
+    assert.equal((await mallory.post('/api/contributions', { item_id: 'itm_m1', pledged_amount: 1 })).status, 403);
+
+    // Buying outright and funding together are alternatives, in both directions.
+    db.prepare("UPDATE items SET price = 40, allow_group_chip_in = 1 WHERE id = 'itm_j3'").run();
+    assert.equal((await maya.post('/api/contributions', { item_id: 'itm_j3', pledged_amount: 40 })).status, 201);
+    assert.equal((await arthur.post('/api/claims', { item_id: 'itm_j3' })).status, 409, 'fully funded: nothing left to reserve');
+    db.prepare("UPDATE items SET allow_group_chip_in = 1 WHERE id = 'itm_j1'").run();
+    assert.equal((await arthur.post('/api/claims', { item_id: 'itm_j1' })).status, 201);
+    assert.equal((await maya.post('/api/contributions', { item_id: 'itm_j1', pledged_amount: 5 })).status, 409, 'reserved: nothing left to fund');
+
+    // Once the gift has arrived a pledge stays on record.
+    const elena = await app.as('usr_elena');
+    db.prepare("UPDATE items SET status = 'received' WHERE id = 'itm_m1'").run();
+    assert.equal((await elena.del('/api/contributions/cnt_2')).status, 409);
   } finally { await app.close(); }
 });
 
-test('Secret Santa: organizers only, valid draws, solvable exclusion sets succeed, one live draw per circle', async () => {
+test('Secret Santa: organizers only, fair draws, no dictated pairings, one live draw, survives someone leaving', async () => {
   const db = testDb();
   const draw = (extra = {}) => createSecretSantaExchange(db, {
     groupId: 'grp_smith', name: 'Winter', eventDate: '2099-12-25', budgetLimit: 75, createdBy: 'usr_justin', ...extra
   });
+  const pairsOf = (id) => db.prepare('SELECT giver_user_id AS g, recipient_user_id AS r FROM secret_santa_pairings WHERE exchange_id = ?').all(id);
 
   assert.throws(() => draw({ createdBy: 'usr_elena' }), /organizer/);
   assert.throws(() => draw({ exclusions: [['usr_justin', 'usr_nobody']] }), /two different people/);
   assert.throws(() => draw({ eventDate: 'soon' }), /valid/);
+  assert.throws(() => draw({ eventDate: '2020-12-25' }), /today or a later date/);
 
-  // Exclusions that leave only the "two mutual pairs" solution must still succeed.
-  for (let i = 0; i < 25; i++) {
-    const ex = draw({ exclusions: [['usr_justin', 'usr_elena'], ['usr_justin', 'usr_arthur'], ['usr_maya', 'usr_elena'], ['usr_maya', 'usr_arthur']] });
-    const pairs = db.prepare('SELECT giver_user_id AS g, recipient_user_id AS r FROM secret_santa_pairings WHERE exchange_id = ?').all(ex.id);
+  // Exclusions that pin the outcome down are refused: whoever chose them would know every pairing.
+  assert.throws(() => draw({ exclusions: [['usr_justin', 'usr_elena'], ['usr_justin', 'usr_arthur'], ['usr_maya', 'usr_elena'], ['usr_maya', 'usr_arthur']] }), /would not be secret/);
+  assert.throws(() => draw({ exclusions: [['usr_justin', 'usr_maya'], ['usr_justin', 'usr_elena'], ['usr_justin', 'usr_arthur']] }), /no valid draw/);
+
+  // Every allowed outcome is equally likely. Four people have nine possible draws.
+  const seen = new Map();
+  const rounds = 1800;
+  for (let i = 0; i < rounds; i++) {
+    const pairs = pairsOf(draw().id);
     assert.equal(pairs.length, 4);
     assert.equal(new Set(pairs.map(p => p.r)).size, 4, 'everyone receives exactly once');
     for (const p of pairs) assert.notEqual(p.g, p.r);
-    assert.equal(pairs.find(p => p.g === 'usr_justin').r, 'usr_maya');
+    const key = pairs.map(p => `${p.g}>${p.r}`).sort().join(' ');
+    seen.set(key, (seen.get(key) || 0) + 1);
   }
-  assert.throws(() => draw({ exclusions: [['usr_justin', 'usr_maya'], ['usr_justin', 'usr_elena'], ['usr_justin', 'usr_arthur']] }), /no valid draw/);
+  assert.equal(seen.size, 9, 'including the outcomes where two people draw each other');
+  const expected = rounds / 9;
+  const chi2 = [...seen.values()].reduce((sum, n) => sum + (n - expected) ** 2 / expected, 0);
+  assert.ok(chi2 < 40, `draws are uniform (chi-square ${chi2.toFixed(1)} on 8 degrees of freedom)`);
+
+  // An ordinary exclusion is respected.
+  for (let i = 0; i < 30; i++) {
+    const pairs = pairsOf(draw({ exclusions: [['usr_justin', 'usr_maya']] }).id);
+    assert.ok(!pairs.some(p => (p.g === 'usr_justin' && p.r === 'usr_maya') || (p.g === 'usr_maya' && p.r === 'usr_justin')));
+  }
+
+  // Someone closing their account does not leave a hole in the draw.
+  db.prepare("INSERT INTO users (id, name, email, created_at) VALUES ('usr_fifth', 'Fifth', 'fifth@example.com', ?)").run(new Date().toISOString());
+  db.prepare("INSERT INTO group_members (group_id, user_id, role, joined_at) VALUES ('grp_smith', 'usr_fifth', 'member', ?)").run(new Date().toISOString());
+  const five = draw();
+  deleteAccount(db, 'usr_fifth');
+  const after = pairsOf(five.id);
+  assert.equal(after.length, 4);
+  assert.deepEqual(after.map(p => p.g).sort(), after.map(p => p.r).sort(), 'everyone still gives once and receives once');
+  for (const p of after) assert.notEqual(p.g, p.r);
+  assert.ok(!JSON.stringify(after).includes('usr_fifth'));
 
   const app = await startApp();
   try {
     const justin = await app.as('usr_justin');
     const body = { group_id: 'grp_smith', name: 'Winter', event_date: '2099-12-25', exclusions: [['usr_justin', 'usr_maya']] };
+    assert.equal((await justin.post('/api/secret-santa', { ...body, event_date: '2020-01-01' })).status, 400, 'a past date cannot be used to draw again and again');
     assert.equal((await justin.post('/api/secret-santa', body)).status, 201);
     assert.equal((await justin.post('/api/secret-santa', body)).status, 409, 'no re-rolling');
     const mallory = await app.signUp('mallory@example.com', 'Mallory');
-    assert.equal((await mallory.post('/api/secret-santa', { ...body, group_id: 'grp_smith' })).status, 403);
+    const outsider = await mallory.post('/api/secret-santa', { ...body, group_id: 'grp_smith' });
+    const nowhere = await mallory.post('/api/secret-santa', { ...body, group_id: 'grp_nope' });
+    assert.deepEqual([outsider.status, outsider.json], [nowhere.status, nowhere.json], 'a circle you are not in looks like one that does not exist');
 
     const groups = (await justin.get('/api/groups')).json.groups;
     const ex = groups[0].exchanges[0];
     assert.ok(ex.my_assigned_recipient.id && ex.my_assigned_recipient.id !== 'usr_maya');
     assert.ok(!JSON.stringify(groups).includes('@'), 'no email addresses in the circle payload');
+    // The rules of the draw are visible to everyone in it, not only to whoever set them.
+    const elena = await app.as('usr_elena');
+    const hers = (await elena.get('/api/groups')).json.groups[0];
+    assert.deepEqual(hers.exchanges[0].exclusions, [['Justin Smith', 'Maya Smith']]);
+    assert.equal(hers.invite_code, null, 'the invite code stays with the organizers');
     assert.deepEqual((await app.guest.get('/api/groups')).json.groups, []);
     assert.deepEqual((await mallory.get('/api/groups')).json.groups, []);
   } finally { await app.close(); }

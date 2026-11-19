@@ -28,6 +28,44 @@ function runMigrations(db) {
     db.exec('ALTER TABLE claims ADD COLUMN expiry_warned INTEGER NOT NULL DEFAULT 0;');
   }
 
+  const cols = (table) => new Set(db.prepare(`PRAGMA table_info(${table})`).all().map(c => c.name));
+  if (!cols('auth_challenges').has('requester')) {
+    db.exec('ALTER TABLE auth_challenges ADD COLUMN requester TEXT;');
+  }
+  // Used only to keep an administrator from seeing activity on their own
+  // sealed lists; never returned to anyone.
+  if (!cols('analytics_events').has('list_id')) {
+    db.exec('ALTER TABLE analytics_events ADD COLUMN list_id TEXT;');
+  }
+  // The earliest date a sealed list may be opened, independent of later
+  // edits to its occasion date. Only ever moves later.
+  if (!cols('lists').has('sealed_until')) {
+    db.exec('ALTER TABLE lists ADD COLUMN sealed_until TEXT;');
+  }
+  // When the current hold began (a hold can be renewed, so this is not created_at).
+  if (!claimCols.has('hold_started_at')) {
+    db.exec('ALTER TABLE claims ADD COLUMN hold_started_at TEXT;');
+  }
+  // IANA zone reported by the person's browser; used for quiet hours only.
+  if (!cols('users').has('time_zone')) {
+    db.exec('ALTER TABLE users ADD COLUMN time_zone TEXT;');
+  }
+
+  // Blocks used to be follows rows with status 'blocked'. That let the wrong
+  // party edit them and tied a block to a follow. They are their own table now.
+  const legacyBlocks = db.prepare("SELECT * FROM follows WHERE status = 'blocked'").all();
+  for (const f of legacyBlocks) {
+    const blocker = f.target_type === 'user'
+      ? f.target_id
+      : db.prepare('SELECT owner_id FROM lists WHERE id = ?').get(f.target_id)?.owner_id;
+    if (blocker && db.prepare('SELECT 1 FROM users WHERE id = ?').get(blocker)) {
+      const email = db.prepare('SELECT email FROM users WHERE id = ?').get(f.follower_id)?.email;
+      db.prepare('INSERT OR IGNORE INTO blocks (blocker_id, blocked_id, blocked_email_hash, created_at) VALUES (?, ?, ?, ?)')
+        .run(blocker, f.follower_id, email ? sha256(email.toLowerCase()) : null, f.created_at);
+    }
+    db.prepare('DELETE FROM follows WHERE id = ?').run(f.id);
+  }
+
   // Lookups that every list / dashboard request performs. Without these each
   // one is a full table scan.
   db.exec(`
@@ -44,6 +82,16 @@ function runMigrations(db) {
     CREATE INDEX IF NOT EXISTS idx_outbox_recipient ON notifications_outbox(recipient_user_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_events_list ON events(list_id, at);
     CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+    CREATE INDEX IF NOT EXISTS idx_sessions_expiry ON sessions(expires_at);
+    CREATE INDEX IF NOT EXISTS idx_claims_status_expiry ON claims(status, expires_at);
+    CREATE INDEX IF NOT EXISTS idx_users_email_lower ON users(LOWER(email));
+    CREATE INDEX IF NOT EXISTS idx_challenges_email ON auth_challenges(email, created_at);
+    CREATE INDEX IF NOT EXISTS idx_exchanges_group ON secret_santa_exchanges(group_id);
+    CREATE INDEX IF NOT EXISTS idx_contributions_list ON contributions(list_id);
+    CREATE INDEX IF NOT EXISTS idx_group_members_user ON group_members(user_id);
+    CREATE INDEX IF NOT EXISTS idx_follows_follower ON follows(follower_id);
+    CREATE INDEX IF NOT EXISTS idx_outbox_due ON notifications_outbox(scheduled_for) WHERE sent_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_analytics_created ON analytics_events(created_at);
   `);
 }
 
@@ -409,6 +457,18 @@ export function initSchema(db) {
       expires_at TEXT NOT NULL,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
+
+    -- 24. Blocks. blocked_email_hash lets a block survive the blocked person
+    --     deleting their account and signing up again with the same address.
+    CREATE TABLE IF NOT EXISTS blocks (
+      blocker_id TEXT NOT NULL,
+      blocked_id TEXT,
+      blocked_email_hash TEXT,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY (blocker_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_blocks_pair ON blocks(blocker_id, blocked_id) WHERE blocked_id IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(blocked_email_hash);
 
     -- 23. Passwordless sign-in challenges (6-digit code sent to the email).
     CREATE TABLE IF NOT EXISTS auth_challenges (

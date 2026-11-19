@@ -35,8 +35,13 @@ test('lists cannot be discovered: guests and strangers get nothing without the l
     assert.equal(viaLink.viewer_role, 'guest');
     const cash = viaLink.items.find(i => i.id === 'itm_j4');
     assert.equal(cash.giving_instructions, null, 'payment handles are for the circle');
+    // Someone with only the link learns "taken" and how many are left — no row
+    // per reservation, no pledges, no amounts.
     const sweater = viaLink.items.find(i => i.id === 'itm_j2');
-    assert.deepEqual([sweater.claim_summary.claims[0].claimer_display, sweater.claim_summary.claims[0].status], ['Someone', 'taken']);
+    assert.deepEqual(sweater.claim_summary, { qty_remaining: 0, is_fully_claimed: true, claims: [], contributions: [] });
+    // The link is the credential: the list's id alone opens nothing for them.
+    assert.equal((await mallory.get('/api/lists/lst_justin_holiday')).status, 404);
+    assert.equal((await app.guest.get('/api/lists/lst_justin_holiday')).status, 404);
 
     // A stranger with the link can hold a limited number of items.
     const taken = [];
@@ -100,39 +105,57 @@ test('items: only editors of the list — and of the destination — can change,
   } finally { await app.close(); }
 });
 
-test('follows: the person being followed decides; a block cannot be undone by the blocked person', async () => {
+test('follows and blocks: the followed person decides; a block is its own record that only the blocker can lift', async () => {
   const app = await startApp();
   try {
     const justin = await app.as('usr_justin');
     const elena = await app.as('usr_elena');
 
-    assert.equal((await justin.patch('/api/follows/fol_6', { status: 'blocked' })).json.follow.status, 'blocked');
-    assert.equal((await elena.get('/api/lists/lst_justin_holiday')).status, 404);
+    // A follow row can only ever be pending or approved, and only the followed person changes it.
+    assert.equal((await justin.patch('/api/follows/fol_6', { status: 'blocked' })).status, 400);
     assert.equal((await elena.patch('/api/follows/fol_6', { status: 'approved' })).status, 403);
-    assert.equal((await elena.del('/api/follows/fol_6')).status, 404);
+
+    assert.equal((await justin.post('/api/blocks', { user_id: 'usr_elena' })).status, 200);
+    assert.equal((await elena.get('/api/lists/lst_justin_holiday')).status, 404);
+    assert.equal((await elena.get('/api/lists/justin-winter-2026')).status, 404, 'not even with the link');
+    assert.equal((await elena.del('/api/follows/fol_6')).status, 404, 'the follow is gone');
     assert.equal((await elena.post('/api/follows', { target_id: 'usr_justin' })).status, 404);
     assert.equal((await elena.post('/api/claims', { item_id: 'itm_j1' })).status, 403);
     assert.equal((await elena.post('/api/secret-ideas', { subject_user_id: 'usr_justin', title: 'x' })).status, 403);
+    assert.equal((await elena.del('/api/blocks/usr_elena?for=usr_justin')).status, 403, 'the blocked person cannot lift it');
     const dash = (await elena.get('/api/dashboard')).json;
     assert.ok(!dash.people_i_shop_for.some(p => p.person.id === 'usr_justin'), 'blocked people do not see you on their dashboard');
+    assert.deepEqual((await justin.get('/api/follows')).json.blocked.map(b => b.blocked_id), ['usr_elena']);
 
-    assert.equal((await justin.patch('/api/follows/fol_6', { status: 'approved' })).json.follow.status, 'approved');
+    assert.equal((await justin.del('/api/blocks/usr_elena')).status, 200);
     assert.equal((await elena.get('/api/lists/lst_justin_holiday')).status, 200);
 
-    // Reporting someone blocks them even if they never followed.
+    // Reporting someone blocks them even if they never followed — and the
+    // reporter cannot turn that record into a follow in either direction.
     const mallory = await app.signUp('mallory@example.com', 'Mallory');
-    await justin.post('/api/reports', { target_type: 'user', target_id: mallory.user.id, reason: 'spam' });
+    assert.equal((await justin.post('/api/reports', { target_type: 'user', target_id: mallory.user.id, reason: 'spam' })).status, 201);
     assert.equal((await mallory.post('/api/follows', { target_id: 'usr_justin' })).status, 404);
+    assert.equal(app.db.prepare('SELECT COUNT(*) AS n FROM follows WHERE follower_id = ? OR target_id = ?').get(mallory.user.id, mallory.user.id).n, 0);
+    // Reports need a real, visible target; reporting a person needs an account.
+    assert.equal((await app.guest.post('/api/reports', { target_type: 'user', target_id: 'usr_justin', reason: 'x' })).status, 404);
+    assert.equal((await app.guest.post('/api/reports', { target_type: 'list', target_id: 'lst_nope', reason: 'x' })).status, 404);
+    assert.equal((await app.guest.post('/api/reports', { target_type: 'list', target_id: 'lst_justin_holiday', reason: 'x' })).status, 201);
 
-    // Follows of a child profile go to the guardians, who can manage them.
+    // Follows of a child profile go to the guardians, who can manage them and block in the child's name.
     const stranger = await app.signUp('stranger@example.com', 'Stranger');
     const f = await stranger.post('/api/follows', { target_id: 'usr_leo' });
     assert.equal(f.json.follow.status, 'pending');
-    assert.ok((await justin.get('/api/follows')).json.followers_of_me.some(x => x.id === f.json.follow.id));
-    assert.equal((await justin.patch(`/api/follows/${f.json.follow.id}`, { status: 'blocked' })).status, 200);
+    assert.equal((await stranger.get('/api/follows')).json.who_i_follow[0].target_name, null, 'a pending request does not reveal the name behind an id');
+    assert.ok((await justin.get('/api/follows')).json.followers_of_me.some(x => x.id === f.json.follow.id && x.for_user_id === 'usr_leo'));
+    assert.equal((await stranger.post('/api/blocks', { user_id: 'usr_justin', for_user_id: 'usr_leo' })).status, 403);
+    assert.equal((await justin.post('/api/blocks', { user_id: stranger.user.id, for_user_id: 'usr_leo' })).status, 200);
+    assert.equal((await stranger.post('/api/follows', { target_id: 'usr_leo' })).status, 404);
+    assert.equal((await stranger.post('/api/follows', { target_id: 'usr_justin' })).status, 201, "a block made for the child is the child's, not the guardian's");
     // A list can only be followed by someone who can open it.
     const priv = (await justin.post('/api/lists', { name: 'P', visibility: 'private' })).json.list;
     assert.equal((await stranger.post('/api/follows', { target_type: 'list', target_id: priv.id })).status, 404);
+    // Budgets are for people you actually shop for.
+    assert.equal((await stranger.post('/api/budgets', { subject_user_id: 'usr_maya', amount: 10 })).status, 400);
   } finally { await app.close(); }
 });
 

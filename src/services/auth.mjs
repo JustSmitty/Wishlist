@@ -14,7 +14,8 @@
 import { uid, secretToken, sixDigitCode, sha256, safeEqual, inTransaction } from '../db/schema.mjs';
 import { badRequest, forbidden, notFound, tooMany } from '../errors.mjs';
 import { sendNotification } from './notifications.mjs';
-import { cleanText } from './capture.mjs';
+import { cleanText, daysInMonth } from './capture.mjs';
+import { reapplyBlocksForEmail } from './access.mjs';
 
 const SESSION_DAYS = 30;
 const API_TOKEN_DAYS = 365;
@@ -39,7 +40,8 @@ export function publicSelf(user) {
     birthday_day: user.birthday_day,
     is_dependent: Boolean(user.is_dependent),
     is_admin: Boolean(user.is_admin),
-    follow_approval_required: Boolean(user.follow_approval_required)
+    follow_approval_required: Boolean(user.follow_approval_required),
+    time_zone: user.time_zone || null
   };
 }
 
@@ -59,10 +61,13 @@ export function createSession(db, userId, { kind = 'web', label = null } = {}) {
 }
 
 /** Returns { user, session } for a live token, otherwise null. */
-export function resolveSession(db, token) {
+export function resolveSession(db, token, expectedKind) {
   if (!token || typeof token !== 'string' || token.length > 200) return null;
   const session = db.prepare('SELECT * FROM sessions WHERE token_hash = ?').get(sha256(token));
-  if (!session) return null;
+  // A browser session is only valid as a cookie and an extension token only
+  // as a bearer header. The kind decides what the credential may do, so it
+  // must not depend on where the caller chose to put it.
+  if (!session || session.kind !== expectedKind) return null;
   if (session.expires_at <= new Date().toISOString()) {
     db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(session.token_hash);
     return null;
@@ -90,32 +95,43 @@ export function countApiTokens(db, userId) {
  * Step 1: send a code. The response is identical whether or not the address
  * already has an account, so this cannot be used to discover who is a member.
  */
-export function startSignIn(db, { email }) {
+export function startSignIn(db, { email, requester = null }) {
   const normalized = normalizeEmail(email);
   if (!normalized) throw badRequest('Enter a valid email address');
 
   const now = new Date();
-  const recent = db.prepare(
+  // Two limits. The tight one is per requester, so one person hammering an
+  // address cannot use up its allowance and lock the real owner out. The
+  // loose one is per address, and bounds how much mail anyone can cause.
+  const since = (minutes) => new Date(now.getTime() - minutes * 60 * 1000).toISOString();
+  const byRequester = db.prepare(
+    'SELECT COUNT(*) AS n FROM auth_challenges WHERE email = ? AND requester IS ? AND created_at > ?'
+  ).get(normalized, requester, since(15)).n;
+  const byAddress = db.prepare(
     'SELECT COUNT(*) AS n FROM auth_challenges WHERE email = ? AND created_at > ?'
-  ).get(normalized, new Date(now.getTime() - 15 * 60 * 1000).toISOString()).n;
-  if (recent >= 5) throw tooMany('Too many codes requested for this address. Try again in a few minutes.');
+  ).get(normalized, since(60)).n;
+  if (byRequester >= 5 || byAddress >= 20) {
+    throw tooMany('Too many codes requested for this address. Try again in a few minutes.');
+  }
 
-  const id = uid('chl');
+  const id = secretToken('chl');
   const code = sixDigitCode();
   db.prepare(`
-    INSERT INTO auth_challenges (id, email, code_hash, expires_at, created_at)
-    VALUES (?, ?, ?, ?, ?)
+    INSERT INTO auth_challenges (id, email, code_hash, expires_at, created_at, requester)
+    VALUES (?, ?, ?, ?, ?, ?)
   `).run(
     id, normalized, sha256(`${id}:${code}`),
     new Date(now.getTime() + CHALLENGE_MINUTES * 60 * 1000).toISOString(),
-    now.toISOString()
+    now.toISOString(), requester
   );
 
   sendNotification(db, {
     recipientEmail: normalized,
     eventType: 'sign_in_code',
     subject: 'Your Hushlist sign-in code',
-    body: `Your sign-in code is ${code}. It expires in ${CHALLENGE_MINUTES} minutes. If you did not ask for it, ignore this message.`
+    body: `Your sign-in code is ${code}. It expires in ${CHALLENGE_MINUTES} minutes. If you did not ask for it, ignore this message.`,
+    // The code goes to the mailbox only. What is kept is a record that one was sent.
+    storedBody: `A sign-in code was sent. It expires in ${CHALLENGE_MINUTES} minutes.`
   });
 
   return { challenge_id: id, code, expires_in_minutes: CHALLENGE_MINUTES };
@@ -133,16 +149,19 @@ export function completeSignIn(db, { challengeId, code, profile = null, adminEma
     throw badRequest('That code has expired. Request a new one.');
   }
 
+  // The code is required on every call until the challenge is used up,
+  // including the second step where a new person supplies their name. The
+  // challenge id alone is never enough.
+  if (challenge.attempts >= MAX_CODE_ATTEMPTS) {
+    throw tooMany('Too many wrong codes. Request a new one.');
+  }
+  const ok = safeEqual(challenge.code_hash, sha256(`${challenge.id}:${String(code ?? '').trim()}`));
+  if (!ok) {
+    db.prepare('UPDATE auth_challenges SET attempts = attempts + 1 WHERE id = ?').run(challenge.id);
+    const left = MAX_CODE_ATTEMPTS - (challenge.attempts + 1);
+    throw badRequest(left > 0 ? `That code is not right (${left} attempt${left === 1 ? '' : 's'} left)` : 'Too many wrong codes. Request a new one.');
+  }
   if (!challenge.verified_at) {
-    if (challenge.attempts >= MAX_CODE_ATTEMPTS) {
-      throw tooMany('Too many wrong codes. Request a new one.');
-    }
-    const ok = safeEqual(challenge.code_hash, sha256(`${challenge.id}:${String(code ?? '').trim()}`));
-    if (!ok) {
-      db.prepare('UPDATE auth_challenges SET attempts = attempts + 1 WHERE id = ?').run(challenge.id);
-      const left = MAX_CODE_ATTEMPTS - (challenge.attempts + 1);
-      throw badRequest(left > 0 ? `That code is not right (${left} attempt${left === 1 ? '' : 's'} left)` : 'Too many wrong codes. Request a new one.');
-    }
     db.prepare('UPDATE auth_challenges SET verified_at = ? WHERE id = ?').run(nowIso, challenge.id);
   }
 
@@ -160,7 +179,7 @@ export function completeSignIn(db, { challengeId, code, profile = null, adminEma
 
       const userId = uid('usr');
       const month = intInRange(profile?.birthday_month, 1, 12);
-      const day = intInRange(profile?.birthday_day, 1, 31);
+      const day = month ? intInRange(profile?.birthday_day, 1, daysInMonth(month)) : null;
       db.prepare(`
         INSERT INTO users (id, name, email, birthday_month, birthday_day, is_dependent, is_admin, status, created_at)
         VALUES (?, ?, ?, ?, ?, 0, ?, 'active', ?)
@@ -171,10 +190,16 @@ export function completeSignIn(db, { challengeId, code, profile = null, adminEma
         VALUES (?, ?, ?, 'Birthday', 'link', 1, ?, ?)
       `).run(uid('lst'), userId, `${name}'s wishlist`, secretToken('shr'), nowIso);
 
+      // Blocks placed on this address before an earlier account was closed
+      // apply to the new account too.
+      reapplyBlocksForEmail(db, userId, challenge.email);
+
       user = db.prepare('SELECT * FROM users WHERE id = ?').get(userId);
       created = true;
-    } else if (adminEmails.has(challenge.email) && !user.is_admin) {
-      db.prepare('UPDATE users SET is_admin = 1 WHERE id = ?').run(user.id);
+    } else if (adminEmails.size > 0 && Boolean(user.is_admin) !== adminEmails.has(challenge.email)) {
+      // HUSHLIST_ADMIN_EMAILS is the source of truth whenever it is set:
+      // adding an address grants the role, removing it takes the role away.
+      db.prepare('UPDATE users SET is_admin = ? WHERE id = ?').run(adminEmails.has(challenge.email) ? 1 : 0, user.id);
       user = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
     }
 
@@ -188,29 +213,56 @@ export function completeSignIn(db, { challengeId, code, profile = null, adminEma
 }
 
 /**
- * Adds a user to a group by its invite code and shares the user's lists with
- * it. The invite code is the only way in: a group id alone is not enough.
+ * Adds a user to a group by its invite code. The invite code is the only way
+ * in: a group id alone is not enough.
  */
 export function joinGroupByInvite(db, userId, inviteCode, { quiet = false } = {}) {
-  const group = db.prepare('SELECT * FROM groups WHERE invite_code = ?').get(String(inviteCode ?? '').trim());
+  const code = String(inviteCode ?? '').trim().toUpperCase();
+  let group = code ? db.prepare('SELECT * FROM groups WHERE UPPER(invite_code) = ?').get(code) : null;
+  // Someone an organizer has blocked gets the same answer as a wrong code.
+  if (group && db.prepare(`
+    SELECT 1 FROM blocks b
+    JOIN group_members gm ON gm.user_id = b.blocker_id AND gm.group_id = ? AND gm.role = 'organizer'
+    WHERE b.blocked_id = ?
+  `).get(group.id, userId)) group = null;
   if (!group) {
     if (quiet) return null;
     throw notFound('That invite code does not match a circle');
   }
-  const nowIso = new Date().toISOString();
+  // Joining shares nothing by itself. Lists shared by link are open to circle
+  // members anyway; a list scoped to particular circles stays scoped to them
+  // until its owner chooses to add this one.
   db.prepare('INSERT OR IGNORE INTO group_members (group_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)')
-    .run(group.id, userId, 'member', nowIso);
-  const myLists = db.prepare("SELECT id FROM lists WHERE owner_id = ? AND visibility != 'private'").all(userId);
-  for (const l of myLists) {
-    db.prepare(`
-      INSERT OR IGNORE INTO list_shares (id, list_id, grantee_type, grantee_id, permission, created_at)
-      VALUES (?, ?, 'group', ?, 'viewer', ?)
-    `).run(uid('shr'), l.id, group.id, nowIso);
-  }
+    .run(group.id, userId, 'member', new Date().toISOString());
   return { id: group.id, name: group.name };
 }
 
 function intInRange(value, min, max) {
   const n = Number(value);
   return Number.isInteger(n) && n >= min && n <= max ? n : null;
+}
+
+/**
+ * Applies HUSHLIST_ADMIN_EMAILS to existing accounts. When the list is set it
+ * decides who is an administrator, so an address taken off it loses the role
+ * the next time the server starts (and at that person's next sign-in), not never.
+ * When it is empty nothing changes: demo data keeps its sample administrator.
+ */
+export function syncAdmins(db, adminEmails) {
+  if (!adminEmails || adminEmails.size === 0) return;
+  const rows = db.prepare("SELECT id, email, is_admin FROM users WHERE status = 'active' AND email IS NOT NULL").all();
+  for (const u of rows) {
+    const should = adminEmails.has(u.email.toLowerCase()) ? 1 : 0;
+    if (u.is_admin !== should) {
+      db.prepare('UPDATE users SET is_admin = ? WHERE id = ?').run(should, u.id);
+      // A demoted administrator's open sessions end with the role.
+      if (!should) db.prepare('DELETE FROM sessions WHERE user_id = ?').run(u.id);
+    }
+  }
+}
+
+/** Removes sign-in challenges and sessions that can no longer be used. */
+export function purgeExpiredAuth(db, now = new Date()) {
+  db.prepare('DELETE FROM auth_challenges WHERE created_at < ?').run(new Date(now.getTime() - 24 * 3600 * 1000).toISOString());
+  db.prepare('DELETE FROM sessions WHERE expires_at <= ?').run(now.toISOString());
 }

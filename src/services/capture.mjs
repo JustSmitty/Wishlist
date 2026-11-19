@@ -162,12 +162,46 @@ export function cleanText(val, maxLength = 500) {
       .replace(/&(amp|quot|apos|lt|gt|nbsp);/gi, (_, name) => NAMED_ENTITIES[name.toLowerCase()]));
     if (text === before) break;
   }
-  return text
-    .replace(/[\u0000-\u001f\u007f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, ' ')
+  // Control characters and the invisible direction overrides go. The zero
+  // width joiner and non-joiner stay: family and flag emoji are built with the
+  // first, and Persian and several Indic scripts are misspelled without the second.
+  text = text
+    .replace(/[\u0000-\u001f\u007f\u200b\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
-    .slice(0, maxLength)
-    .trim();
+    .slice(0, maxLength);
+  // Cutting by length can split a character that is stored as two units.
+  return text.replace(LONE_SURROGATE, '').trim();
+}
+
+const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/g;
+
+// Element names of HTML, SVG and MathML. Only these (and custom elements, and
+// anything carrying attributes) are treated as markup. People also type angle
+// brackets as ordinary punctuation — a size written "<Medium>", a placeholder
+// like "<Untitled>" — and those are kept.
+const MARKUP_NAMES = new Set(`a abbr acronym address animate animatemotion animatetransform applet area article aside audio b base
+basefont bdi bdo bgsound big blink blockquote body br button canvas caption center circle cite clippath code col colgroup
+content data datalist dd defs del desc details dfn dialog dir div dl dt ellipse em embed feblend fecolormatrix
+fecomponenttransfer fecomposite feconvolvematrix fediffuselighting fedisplacementmap fedistantlight fedropshadow feflood
+fefunca fefuncb fefuncg fefuncr fegaussianblur feimage femerge femergenode femorphology feoffset fepointlight
+fespecularlighting fespotlight fetile feturbulence fieldset figcaption figure filter font footer foreignobject form frame
+frameset g h1 h2 h3 h4 h5 h6 head header hgroup hr html i iframe image img input ins isindex kbd keygen label legend li
+line lineargradient link listing main map mark marker marquee mask math menu menuitem meta metadata meter mi mn mo
+mpath ms mtext multicol nav nextid nobr noembed noframes noscript object ol optgroup option output p param path
+pattern picture plaintext polygon polyline pre progress q radialgradient rb rect rp rt rtc ruby s samp script search
+section select set shadow slot small source spacer span stop strike strong style sub summary sup svg switch symbol
+table tbody td template text textarea textpath tfoot th thead time title tr track tspan tt u ul use var video view
+wbr xmp annotation semantics mrow mfrac msqrt mroot mstyle merror mpadded mphantom mfenced menclose msub msup
+msubsup munder mover munderover mmultiscripts mtable mtr mtd maction`.split(/\s+/));
+
+function looksLikeMarkup(tagText) {
+  // tagText runs from "<" to ">" inclusive.
+  const m = /^<\/?([a-zA-Z][a-zA-Z0-9]*)([:-][^\s/>]*)?([^>]*)>$/.exec(tagText);
+  if (!m) return true; // comments, doctype, anything unusual: remove
+  if (m[2]) return true; // custom or namespaced element
+  if (MARKUP_NAMES.has(m[1].toLowerCase())) return true;
+  return /[=]/.test(m[3]); // an unknown name with attributes is still treated as markup
 }
 
 /**
@@ -209,6 +243,12 @@ export function stripTags(text) {
     } else {
       const gt = text.indexOf('>', lt);
       end = gt === -1 ? -1 : gt + 1;
+      if (end !== -1 && end - lt <= 80 && !looksLikeMarkup(text.slice(lt, end))) {
+        // Angle brackets used as punctuation: keep the text as written.
+        out += '<';
+        pos = lt + 1;
+        continue;
+      }
     }
     if (end === -1) {
       // No closing ">" anywhere ahead: nothing further can be a tag.
@@ -235,18 +275,37 @@ export function cleanMultilineText(val, maxLength = 2000) {
     .replace(/\n{3,}/g, '\n\n').trim().slice(0, maxLength);
 }
 
-/** Finite, non-negative money amount rounded to cents, else null. */
+/**
+ * Finite, non-negative money amount rounded to cents, else null. Accepts a
+ * number, or a string that is a plain decimal ("24", "24.5", "24.99").
+ * Anything else — blank, hexadecimal, exponent notation, lists — is not a price.
+ */
 export function cleanPrice(val, max = 10_000_000) {
-  if (val === null || val === undefined || val === '') return null;
-  const n = typeof val === 'number' ? val : Number(String(val).trim());
+  let n;
+  if (typeof val === 'number') n = val;
+  else if (typeof val === 'string' && /^\d{1,12}(\.\d{1,6})?$/.test(val.trim())) n = Number(val.trim());
+  else return null;
   if (!Number.isFinite(n) || n < 0 || n > max) return null;
   return Math.round(n * 100) / 100;
 }
 
+/**
+ * Whole number clamped to [min, max]. Only a number or a numeric string
+ * counts; null, blank, booleans and lists give the fallback (Number(null) is
+ * 0, which would otherwise silently become the minimum).
+ */
 export function cleanInt(val, min, max, fallback) {
-  const n = Number(val);
+  let n;
+  if (typeof val === 'number') n = val;
+  else if (typeof val === 'string' && /^\s*-?\d{1,15}(\.\d+)?\s*$/.test(val)) n = Number(val);
+  else return fallback;
   if (!Number.isFinite(n)) return fallback;
   return Math.min(max, Math.max(min, Math.trunc(n)));
+}
+
+/** Largest day number a month can have (February allows the 29th). */
+export function daysInMonth(month) {
+  return [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1] || 0;
 }
 
 /** Real calendar date in YYYY-MM-DD form, else null. */
@@ -707,32 +766,46 @@ function extractHeuristics(html, lowerHtml, tags) {
 
 /**
  * Reads one price out of free text. Understands "1,299.00", "1.299,00",
- * "1 299,00 €" and prefers the number next to a currency symbol. When a
- * string holds several numbers ("$12.99 - $15.99") the first is used; digits
- * from different numbers are never glued together.
+ * "1 299,00 €", "₹1,29,999" and prefers the number next to a currency symbol.
+ * When a string holds several numbers ("$12.99 - $15.99") the first is used.
+ *
+ * Digits from different numbers are never glued together: a space only counts
+ * as a thousands separator beside a currency symbol or when the number has a
+ * decimal part ("Pack of 2 500 ml" is not 2500). A single "." or "," followed
+ * by exactly three digits is a thousands separator ("1.299 €" is 1299).
  */
 export function parsePriceNumber(input) {
   if (input === null || input === undefined) return null;
   if (typeof input === 'number') return cleanPrice(input);
   const text = String(input).slice(0, 200);
-  const NUM = String.raw`\d{1,3}(?:[ \u00a0.,\u2019']\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,3})?`;
-  const nearSymbol = text.match(new RegExp(`[$€£¥]\\s*(${NUM})`)) || text.match(new RegExp(`(${NUM})\\s*(?:[$€£¥]|USD|EUR|GBP|CAD|AUD)`, 'i'));
-  const token = nearSymbol ? nearSymbol[1] : (text.match(new RegExp(NUM)) || [])[0];
+  const INDIAN = String.raw`\d{1,2}(?:,\d{2})+,\d{3}(?:\.\d{1,2})?`;
+  const GROUPED = String.raw`\d{1,3}(?:[.,\u2019']\d{3})+(?:[.,]\d{1,2})?`;
+  const SPACED = String.raw`\d{1,3}(?:[ \u00a0]\d{3})+`;
+  const PLAIN = String.raw`\d+(?:[.,]\d{1,3})?`;
+  const NEAR = `${INDIAN}|${GROUPED}|${SPACED}(?:[.,]\\d{1,2})?|${PLAIN}`;
+  const ALONE = `${INDIAN}|${GROUPED}|${SPACED}[.,]\\d{1,2}|${PLAIN}`;
+  const SYMBOL = String.raw`[$€£¥₹]`;
+  const nearSymbol = text.match(new RegExp(`${SYMBOL}\\s*(${NEAR})`)) ||
+    text.match(new RegExp(`(${NEAR})\\s*(?:${SYMBOL}|USD|EUR|GBP|CAD|AUD|INR|CHF|JPY)`, 'i'));
+  const token = nearSymbol ? nearSymbol[1] : (text.match(new RegExp(ALONE)) || [])[0];
   if (!token) return null;
 
   let digits = token.replace(/[ \u00a0\u2019']/g, '');
   const lastComma = digits.lastIndexOf(',');
   const lastDot = digits.lastIndexOf('.');
+  const thousandsOnly = (sep, last) =>
+    digits.indexOf(sep) === last && digits.length - last - 1 === 3 && !/^0+$/.test(digits.slice(0, last));
   if (lastComma !== -1 && lastDot !== -1) {
     // Both present: whichever comes last is the decimal separator.
     const decimal = lastComma > lastDot ? ',' : '.';
     const thousands = decimal === ',' ? '.' : ',';
     digits = digits.split(thousands).join('').replace(decimal, '.');
   } else if (lastComma !== -1) {
-    const decimals = digits.length - lastComma - 1;
-    digits = (digits.indexOf(',') === lastComma && decimals <= 2) ? digits.replace(',', '.') : digits.split(',').join('');
-  } else if (lastDot !== -1 && digits.indexOf('.') !== lastDot) {
-    digits = digits.split('.').join('');
+    const single = digits.indexOf(',') === lastComma;
+    digits = (single && !thousandsOnly(',', lastComma)) ? digits.replace(',', '.') : digits.split(',').join('');
+  } else if (lastDot !== -1) {
+    const single = digits.indexOf('.') === lastDot;
+    if (!single || thousandsOnly('.', lastDot)) digits = digits.split('.').join('');
   }
   return cleanPrice(Number(digits));
 }
@@ -844,7 +917,7 @@ export async function captureFromUrl(db, { url, htmlSnapshot = null, clientExtra
  */
 const MAX_IMPORT_ITEMS = 200;
 
-export function importAmazonList(db, { listId, canEdit, amazonListUrl, itemsPayload = [] }) {
+export function importAmazonList(db, { listId, canEdit, amazonListUrl, itemsPayload = [], actorId = null, maxItemsPerList = 500 }) {
   const list = db.prepare('SELECT * FROM lists WHERE id = ?').get(String(listId ?? ''));
   if (!list) throw notFound('List not found');
   if (!canEdit(list)) throw forbidden('You cannot add items to this list');
@@ -867,9 +940,14 @@ export function importAmazonList(db, { listId, canEdit, amazonListUrl, itemsPayl
   const now = new Date().toISOString();
 
   inTransaction(db, () => {
+    let onList = db.prepare("SELECT COUNT(*) AS n FROM items WHERE list_id = ? AND status IN ('active', 'received')").get(list.id).n;
     itemsPayload.forEach((raw, index) => {
       const label = cleanText(raw?.title, 120) || `Row ${index + 1}`;
       try {
+        if (onList >= maxItemsPerList) {
+          report.failed.push({ title: label, reason: `The list is full (${maxItemsPerList} items)` });
+          return;
+        }
         if (!raw || typeof raw !== 'object' || (!raw.title && !raw.url)) {
           report.failed.push({ title: label, reason: 'Missing title and link' });
           return;
@@ -899,8 +977,8 @@ export function importAmazonList(db, { listId, canEdit, amazonListUrl, itemsPayl
         db.prepare(`
           INSERT INTO items (
             id, list_id, kind, title, canonical_url, original_url, store, image, price, currency,
-            variant, qty_wanted, priority, notes, field_confidence, created_at, updated_at
-          ) VALUES (?, ?, 'product', ?, ?, ?, ?, ?, ?, 'USD', ?, ?, ?, ?, ?, ?, ?)
+            variant, qty_wanted, priority, notes, field_confidence, sort_order, created_at, updated_at
+          ) VALUES (?, ?, 'product', ?, ?, ?, ?, ?, ?, 'USD', ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
           itemId,
           list.id,
@@ -915,9 +993,21 @@ export function importAmazonList(db, { listId, canEdit, amazonListUrl, itemsPayl
           ['most_wanted', 'high', 'normal', 'low'].includes(raw.priority) ? raw.priority : 'normal',
           cleanText(raw.notes, 2000) || null,
           JSON.stringify(itemConfidence),
+          onList,
           now,
           now
         );
+        // The same records a hand-added item gets: a starting point for price
+        // history, and an entry followers' digests can pick up.
+        if (price !== null) {
+          db.prepare('INSERT INTO price_snapshots (id, item_id, price, in_stock, checked_at) VALUES (?, ?, ?, 1, ?)')
+            .run(uid('ps'), itemId, price, now);
+        }
+        db.prepare(`
+          INSERT INTO events (id, actor_id, entity_type, entity_id, list_id, action, details, is_spoiler, at)
+          VALUES (?, ?, 'item', ?, ?, 'item_added', ?, 0, ?)
+        `).run(uid('ev'), actorId, itemId, list.id, JSON.stringify({ title: cleanTitle }), now);
+        onList++;
 
         if (canonical) existingUrls.add(canonical);
         existingTitles.add(cleanTitle.toLowerCase());
@@ -991,7 +1081,7 @@ export function recheckItemPriceAndStock(db, { itemId, newPrice, newInStock = tr
           eventType: 'claimed_item_price_drop',
           listId: item.list_id,
           subject: `Price drop (${dropPct}% off) on "${item.title}"!`,
-          body: `Good news! An item you claimed ("${item.title}") dropped from $${Number(oldPrice).toFixed(2)} to $${Number(parsedPrice).toFixed(2)} (-${dropPct}%).`
+          body: `Good news! An item you claimed ("${item.title}") dropped from ${Number(oldPrice).toFixed(2)} to ${Number(parsedPrice).toFixed(2)} ${item.currency || 'USD'} (-${dropPct}%).`
         });
       }
       if (wentOutOfStock) {

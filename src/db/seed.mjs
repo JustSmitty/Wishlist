@@ -4,6 +4,8 @@
  * .example domain so they can never belong to a real person.
  */
 
+import { inTransaction, secretToken } from './schema.mjs';
+
 export const TOP_30_RETAILER_ADAPTERS = [
   { domain: 'amazon.com', store_name: 'Amazon', title_selector: '#productTitle', price_selector: '.a-price-whole', image_selector: '#landingImage', variant_selector: '#variation_color_name .selection, #variation_size_name .selection', client_only: 1 },
   { domain: 'target.com', store_name: 'Target', title_selector: '[data-test="product-title"]', price_selector: '[data-test="product-price"]', image_selector: '.slideDeckPicture img', variant_selector: '[data-test="variant-value"]', client_only: 0 },
@@ -70,6 +72,12 @@ export function seedDatabase(db) {
 export function seedDemoData(db) {
   const existingUsers = db.prepare('SELECT COUNT(*) as cnt FROM users').get().cnt;
   if (existingUsers > 0) return;
+  // All or nothing: a failure part-way must not leave a half-built family
+  // that the "already seeded" check above would then never repair.
+  inTransaction(db, () => insertDemoData(db));
+}
+
+function insertDemoData(db) {
 
   const now = new Date();
   const nowIso = now.toISOString();
@@ -183,7 +191,8 @@ export function seedDemoData(db) {
   // Leo's 9th Birthday List (Guardian-managed under-13 list)
   insertList.run(
     'lst_leo_bday', 'usr_leo', '[]', "Leo's 9th birthday: LEGO & space",
-    'Birthday', leoDay, null, 'link', 1, 'leo-9th-bday', nowIso
+    // A child's list is shared with the family circle, not by public link.
+    'Birthday', leoDay, null, 'specific', 1, secretToken('shr'), nowIso
   );
 
   // Aunt Elena's Holiday List
@@ -332,22 +341,22 @@ export function seedDemoData(db) {
 
   insertClaim.run(
     'clm_elena_on_justin', 'itm_j2', 'lst_justin_holiday', 'usr_elena',
-    'mng_demo_1', 1, 'purchased', futureExpiry, 'Ordered from REI #98112 - wrapped in blue paper', nowIso, nowIso, nowIso
+    secretToken('mng'), 1, 'purchased', futureExpiry, 'Ordered from REI #98112 - wrapped in blue paper', nowIso, nowIso, nowIso
   );
 
   insertClaim.run(
     'clm_justin_on_maya', 'itm_m2', 'lst_maya_bday', 'usr_justin',
-    'mng_demo_2', 1, 'purchased', futureExpiry, 'Etsy order #44519 — arriving next week', nowIso, nowIso, nowIso
+    secretToken('mng'), 1, 'purchased', futureExpiry, 'Etsy order #44519 — arriving next week', nowIso, nowIso, nowIso
   );
 
   insertClaim.run(
     'clm_justin_on_elena', 'itm_e1', 'lst_elena_holiday', 'usr_justin',
-    'mng_demo_3', 1, 'reserved', futureExpiry, 'Planning to order this weekend', nowIso, nowIso, nowIso
+    secretToken('mng'), 1, 'reserved', futureExpiry, 'Planning to order this weekend', nowIso, nowIso, nowIso
   );
 
   insertClaim.run(
     'clm_arthur_on_leo', 'itm_l2', 'lst_leo_bday', 'usr_arthur',
-    'mng_demo_4', 1, 'purchased', futureExpiry, 'Picked up at Target', nowIso, nowIso, nowIso
+    secretToken('mng'), 1, 'purchased', futureExpiry, 'Picked up at Target', nowIso, nowIso, nowIso
   );
 
   // Group Contributions toward Maya's Le Creuset Dutch Oven ($420 target)

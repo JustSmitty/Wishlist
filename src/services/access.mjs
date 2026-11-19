@@ -7,6 +7,8 @@
  * place and not the others).
  */
 
+import { sha256 } from '../db/schema.mjs';
+
 export function getActiveUser(db, userId) {
   if (!userId || typeof userId !== 'string') return null;
   return db.prepare("SELECT * FROM users WHERE id = ? AND status = 'active'").get(userId) || null;
@@ -40,19 +42,76 @@ export function isGroupOrganizer(db, groupId, userId) {
   ).get(groupId, userId));
 }
 
+// ---------------------------------------------------------------- blocks
+
 /**
- * True when `subjectId` (or, for a child profile, one of the child's
- * guardians) has blocked `viewerId`. A block is a follows row with
- * status = 'blocked' and it exists whether or not the viewer ever followed.
+ * True when `subjectId` has blocked `viewerId`.
+ *
+ * A block belongs to exactly one person. A guardian who blocks someone for
+ * themselves has not blocked them for their child: that is a separate block
+ * made in the child's name, so one guardian cannot silently cut relatives —
+ * or the other guardian — off from the child. A guardian is never blocked
+ * from their own child.
  */
 export function isBlockedBy(db, viewerId, subjectId) {
-  if (!viewerId || !subjectId) return false;
-  return Boolean(db.prepare(`
-    SELECT 1 FROM follows
-    WHERE follower_id = ? AND target_type = 'user' AND status = 'blocked'
-      AND (target_id = ? OR target_id IN (SELECT guardian_id FROM guardian_links WHERE dependent_id = ?))
-  `).get(viewerId, subjectId, subjectId));
+  if (!viewerId || !subjectId || viewerId === subjectId) return false;
+  if (isGuardianOf(db, viewerId, subjectId)) return false;
+  return Boolean(db.prepare('SELECT 1 FROM blocks WHERE blocker_id = ? AND blocked_id = ?').get(subjectId, viewerId));
 }
+
+export function eitherBlocked(db, a, b) {
+  return isBlockedBy(db, a, b) || isBlockedBy(db, b, a);
+}
+
+/**
+ * Blocks a person and removes every standing tie between the two: follows,
+ * helper roles and co-ownership in both directions. Blocking is the only
+ * safety control people have, so it has to end access that was granted
+ * earlier, not just stop new access.
+ */
+export function blockUser(db, blockerId, blockedId) {
+  if (!blockerId || !blockedId || blockerId === blockedId) return;
+  const email = db.prepare('SELECT email FROM users WHERE id = ?').get(blockedId)?.email || null;
+  db.prepare(`
+    INSERT OR IGNORE INTO blocks (blocker_id, blocked_id, blocked_email_hash, created_at) VALUES (?, ?, ?, ?)
+  `).run(blockerId, blockedId, email ? sha256(email.toLowerCase()) : null, new Date().toISOString());
+
+  db.prepare("DELETE FROM follows WHERE follower_id = ? AND target_type = 'user' AND target_id = ?").run(blockedId, blockerId);
+  db.prepare("DELETE FROM follows WHERE follower_id = ? AND target_type = 'list' AND target_id IN (SELECT id FROM lists WHERE owner_id = ?)").run(blockedId, blockerId);
+
+  for (const [owner, other] of [[blockerId, blockedId], [blockedId, blockerId]]) {
+    db.prepare(`
+      DELETE FROM list_shares
+      WHERE grantee_type = 'user' AND grantee_id = ? AND list_id IN (SELECT id FROM lists WHERE owner_id = ?)
+    `).run(other, owner);
+    removeCoOwner(db, owner, other);
+  }
+}
+
+export function unblockUser(db, blockerId, blockedId) {
+  db.prepare('DELETE FROM blocks WHERE blocker_id = ? AND blocked_id = ?').run(blockerId, blockedId);
+}
+
+/** Removes `userId` as co-owner from lists owned by `ownerId` (or from every list when ownerId is null). */
+export function removeCoOwner(db, ownerId, userId) {
+  const rows = ownerId
+    ? db.prepare('SELECT id, co_owner_ids FROM lists WHERE owner_id = ? AND co_owner_ids LIKE ?').all(ownerId, `%"${userId}"%`)
+    : db.prepare('SELECT id, co_owner_ids FROM lists WHERE co_owner_ids LIKE ?').all(`%"${userId}"%`);
+  for (const row of rows) {
+    let ids = [];
+    try { ids = JSON.parse(row.co_owner_ids).filter(id => id !== userId); } catch { /* malformed: reset */ }
+    db.prepare('UPDATE lists SET co_owner_ids = ? WHERE id = ?').run(JSON.stringify(ids), row.id);
+  }
+}
+
+/** Re-attaches blocks that were placed on an address before its account was deleted. */
+export function reapplyBlocksForEmail(db, userId, email) {
+  if (!email) return;
+  db.prepare('UPDATE OR IGNORE blocks SET blocked_id = ? WHERE blocked_id IS NULL AND blocked_email_hash = ?')
+    .run(userId, sha256(String(email).toLowerCase()));
+}
+
+// ---------------------------------------------------------------- circles
 
 /**
  * "In the same circle": shares a group with the person, or — for a child
@@ -82,9 +141,14 @@ export function hasApprovedFollow(db, followerId, { userId = null, listId = null
   `).get(followerId, userId, listId));
 }
 
-/** People who may be named as helper / co-owner / co-guardian by `actorId`. */
+/**
+ * People who may be named as helper / co-owner / co-guardian by `actorId`:
+ * active adults in a shared circle, with no block between the two in either
+ * direction.
+ */
 export function canNameAsCollaborator(db, actorId, otherId) {
   const other = getActiveUser(db, otherId);
-  if (!other || other.is_dependent) return false;
+  if (!other || other.is_dependent || other.id === actorId) return false;
+  if (eitherBlocked(db, actorId, otherId)) return false;
   return sharesGroup(db, actorId, otherId);
 }

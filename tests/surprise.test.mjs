@@ -15,9 +15,9 @@ test('owner payload is byte-identical before and after claims, purchases and ple
   const view = () => JSON.stringify(sanitizeItemForViewer(db, db.prepare("SELECT * FROM items WHERE id = 'itm_j1'").get(), list, ownerCtx, 'usr_justin'));
   const before = view();
 
+  addContribution(db, { itemId: 'itm_j1', contributorUserId: 'usr_maya', pledgedAmount: 75, note: 'Secret chip-in' });
   const claim = createClaim(db, { itemId: 'itm_j1', claimerUserId: 'usr_elena', orderNote: 'Secret order #9988' });
   transitionClaimState(db, { claimId: claim.id, newState: 'purchased', actorId: 'usr_elena' });
-  addContribution(db, { itemId: 'itm_j1', contributorUserId: 'usr_maya', pledgedAmount: 75, note: 'Secret chip-in' });
 
   assert.equal(view(), before);
   assert.equal(JSON.parse(view()).claim_summary, undefined);

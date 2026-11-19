@@ -4,10 +4,17 @@
  * Invariant: nothing addressed to the owner or a co-owner of an unrevealed
  * surprise-mode list may reveal whether an item on that list is claimed.
  *
- * Delivery: this build has no email provider. Rows are written to
- * notifications_outbox and handed to an optional transport. In demo mode the
- * outbox is shown in the app; otherwise the default transport prints to the
- * server log. Wire a real provider in with setMailTransport().
+ * Delivery: this build has no email provider. Messages are written to
+ * notifications_outbox and delivered by dispatchOutbox(), which the server
+ * runs after each request and on a timer. That keeps delivery outside the
+ * database transaction that produced the message (nothing is sent for work
+ * that was rolled back) and is what makes "send later" real: a message held
+ * for quiet hours is sent when its time comes. In demo mode the outbox is
+ * shown in the app; otherwise the default transport prints to the server
+ * log. Wire a real provider in with setMailTransport().
+ *
+ * The one exception is a message carrying a one-time code. Its real text is
+ * never stored, so it is handed to the transport immediately.
  */
 
 import { uid } from '../db/schema.mjs';
@@ -52,6 +59,7 @@ export function sendNotification(db, {
   eventType,
   subject,
   body,
+  storedBody = null,
   listId = null,
   channel = 'email'
 }) {
@@ -91,17 +99,22 @@ export function sendNotification(db, {
       return { skipped: true, reason: 'disabled_by_user_preference' };
     }
 
-    // Quiet hours are evaluated in the recipient's time zone, not the server's.
-    const quietStart = pref ? pref.quiet_hours_start : 21;
-    const quietEnd = pref ? pref.quiet_hours_end : 8;
-    const hour = hourInZone(now, pref?.time_zone);
-    const inQuietHours = quietStart > quietEnd
-      ? (hour >= quietStart || hour < quietEnd)
-      : (hour >= quietStart && hour < quietEnd);
-    if (inQuietHours) {
-      const hoursUntilEnd = (quietEnd - hour + 24) % 24 || 24;
-      scheduledFor = new Date(now.getTime() + hoursUntilEnd * 3600 * 1000);
-      scheduledFor.setUTCMinutes(0, 0, 0);
+    // Quiet hours are judged on the recipient's own clock. If their time zone
+    // is not known, nothing is held back: guessing would delay mail by hours
+    // for most of the world.
+    const zone = db.prepare('SELECT time_zone FROM users WHERE id = ?').get(recipientUserId)?.time_zone;
+    const minuteNow = zone ? minuteOfDayInZone(now, zone) : null;
+    if (minuteNow !== null) {
+      const quietStart = (pref ? pref.quiet_hours_start : 21) * 60;
+      const quietEnd = (pref ? pref.quiet_hours_end : 8) * 60;
+      const inQuietHours = quietStart > quietEnd
+        ? (minuteNow >= quietStart || minuteNow < quietEnd)
+        : (minuteNow >= quietStart && minuteNow < quietEnd);
+      if (inQuietHours) {
+        const minutesUntilEnd = (quietEnd - minuteNow + 1440) % 1440 || 1440;
+        scheduledFor = new Date(now.getTime() + minutesUntilEnd * 60 * 1000);
+        scheduledFor.setUTCSeconds(0, 0);
+      }
     }
   }
 
@@ -109,6 +122,7 @@ export function sendNotification(db, {
   const unsubToken = isTransactional ? null : uid('unsub');
   const nowIso = now.toISOString();
   const dueNow = scheduledFor.getTime() <= now.getTime();
+  const immediate = storedBody !== null;
 
   db.prepare(`
     INSERT INTO notifications_outbox (
@@ -121,16 +135,16 @@ export function sendNotification(db, {
     recipientEmail,
     eventType,
     subject,
-    body,
+    storedBody ?? body,
     channel,
     isTransactional ? 1 : 0,
     unsubToken,
     scheduledFor.toISOString(),
-    dueNow ? nowIso : null,
+    immediate ? nowIso : null,
     nowIso
   );
 
-  if (dueNow && mailTransport) {
+  if (immediate && mailTransport) {
     try {
       mailTransport({ to: recipientEmail, subject, body, eventType });
     } catch (err) {
@@ -141,21 +155,60 @@ export function sendNotification(db, {
   return { id, sent: dueNow, transactional: isTransactional, scheduled_for: scheduledFor.toISOString() };
 }
 
-function hourInZone(date, timeZone) {
+/**
+ * Delivers every stored message whose time has come. Safe to call often: it
+ * is one indexed query when there is nothing to do. A message that fails is
+ * left for the next run, and given up on after three days.
+ */
+export function dispatchOutbox(db, now = new Date()) {
+  const nowIso = now.toISOString();
+  const giveUpBefore = new Date(now.getTime() - 3 * 86400 * 1000).toISOString();
+  const due = db.prepare(`
+    SELECT id, recipient_email, event_type, subject, body FROM notifications_outbox
+    WHERE sent_at IS NULL AND scheduled_for <= ? AND scheduled_for > ?
+    ORDER BY scheduled_for ASC LIMIT 200
+  `).all(nowIso, giveUpBefore);
+  let sent = 0;
+  for (const row of due) {
+    try {
+      if (mailTransport) mailTransport({ to: row.recipient_email, subject: row.subject, body: row.body, eventType: row.event_type });
+      db.prepare('UPDATE notifications_outbox SET sent_at = ? WHERE id = ?').run(nowIso, row.id);
+      sent++;
+    } catch (err) {
+      console.error('[mail] transport failed:', err.message);
+    }
+  }
+  return sent;
+}
+
+export function isValidTimeZone(timeZone) {
+  if (typeof timeZone !== 'string' || !timeZone || timeZone.length > 64) return false;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Minutes since local midnight in the given zone (so :30 and :45 zones are right), or null. */
+function minuteOfDayInZone(date, timeZone) {
   try {
     const parts = new Intl.DateTimeFormat('en-US', {
-      hour: 'numeric', hourCycle: 'h23', timeZone: timeZone || undefined
+      hour: 'numeric', minute: 'numeric', hourCycle: 'h23', timeZone
     }).formatToParts(date);
-    return Number(parts.find(p => p.type === 'hour').value);
+    const get = (type) => Number(parts.find(p => p.type === type).value);
+    return get('hour') * 60 + get('minute');
   } catch {
-    return date.getHours();
+    return null;
   }
 }
 
 /**
- * Follower digest: recent changes on lists the reader follows. At most one per
- * UTC day. Never includes the reader's own lists, and never includes a list
- * the reader could not open right now (private, blocked, share removed).
+ * Follower digest: changes since the reader's last digest on lists they
+ * follow. At most one per UTC day. Never includes the reader's own lists, a
+ * list the reader could not open right now (private, blocked, share removed),
+ * or an item that has since been removed or moved elsewhere.
  */
 export function generateFollowerDigest(db, { followerUserId }) {
   const follower = db.prepare("SELECT * FROM users WHERE id = ? AND status = 'active'").get(followerUserId);
@@ -163,23 +216,30 @@ export function generateFollowerDigest(db, { followerUserId }) {
     return { already_sent_today: false, events_included: 0, notification: { skipped: true, reason: 'no_email' } };
   }
 
-  const todayPrefix = new Date().toISOString().slice(0, 10);
-  const existingToday = db.prepare(`
-    SELECT id FROM notifications_outbox
-    WHERE recipient_user_id = ? AND event_type = 'follower_digest' AND created_at LIKE ?
-    LIMIT 1
-  `).get(follower.id, `${todayPrefix}%`);
+  const now = new Date();
+  const last = db.prepare(`
+    SELECT created_at FROM notifications_outbox
+    WHERE recipient_user_id = ? AND event_type = 'follower_digest'
+    ORDER BY created_at DESC LIMIT 1
+  `).get(follower.id)?.created_at || null;
 
-  if (existingToday) {
+  if (last && last.slice(0, 10) === now.toISOString().slice(0, 10)) {
     return { already_sent_today: true };
   }
 
+  // Everything after the previous digest; for a first digest, the last two weeks.
+  const since = last || new Date(now.getTime() - 14 * 86400 * 1000).toISOString();
+
   const candidates = db.prepare(`
-    SELECT e.*, l.name AS list_name, u.name AS owner_name
+    SELECT e.*, l.name AS list_name, u.name AS owner_name, i.title AS item_title, i.currency AS item_currency
     FROM events e
     JOIN lists l ON l.id = e.list_id
     JOIN users u ON u.id = l.owner_id
+    JOIN items i ON i.id = e.entity_id AND i.list_id = e.list_id AND i.status = 'active'
     WHERE e.is_spoiler = 0
+      AND e.entity_type = 'item'
+      AND e.at > ?
+      AND l.archived_at IS NULL
       AND l.owner_id != ?
       AND (
         l.owner_id IN (SELECT target_id FROM follows WHERE follower_id = ? AND target_type = 'user' AND status = 'approved')
@@ -192,12 +252,15 @@ export function generateFollowerDigest(db, { followerUserId }) {
         OR l.owner_id IN (SELECT dependent_id FROM guardian_links WHERE guardian_id = ?)
       )
     ORDER BY e.at DESC
-    LIMIT 200
-  `).all(follower.id, follower.id, follower.id, follower.id, follower.id);
+  `).iterate(since, follower.id, follower.id, follower.id, follower.id, follower.id);
 
+  // Access is decided list by list before anything counts toward the limit,
+  // so lists the reader cannot open do not crowd out the ones they can.
   const listCache = new Map();
   const recentEvents = [];
+  let scanned = 0;
   for (const ev of candidates) {
+    if (++scanned > 5000) break;
     if (!listCache.has(ev.list_id)) {
       const list = db.prepare('SELECT * FROM lists WHERE id = ?').get(ev.list_id);
       const ctx = getViewerRole(db, list, follower.id);
@@ -210,13 +273,15 @@ export function generateFollowerDigest(db, { followerUserId }) {
 
   const lines = recentEvents.map(ev => {
     const details = safeJsonParse(ev.details, {});
+    const title = ev.item_title;
+    const cur = ev.item_currency || 'USD';
     if (ev.action === 'price_drop') {
-      return `• Price drop (${details.drop_percent}% off) on ${ev.owner_name}'s list "${ev.list_name}": ${details.title} ($${details.old_price} → $${details.new_price})`;
+      return `• Price drop (${details.drop_percent}% off) on ${ev.owner_name}'s list "${ev.list_name}": ${title} (${Number(details.old_price).toFixed(2)} → ${Number(details.new_price).toFixed(2)} ${cur})`;
     }
     if (ev.action === 'back_in_stock') {
-      return `• Back in stock on ${ev.owner_name}'s list "${ev.list_name}": ${details.title}`;
+      return `• Back in stock on ${ev.owner_name}'s list "${ev.list_name}": ${title}`;
     }
-    return `• New on ${ev.owner_name}'s list "${ev.list_name}": ${details.title || ev.action}`;
+    return `• New on ${ev.owner_name}'s list "${ev.list_name}": ${title}`;
   });
 
   if (lines.length === 0) {

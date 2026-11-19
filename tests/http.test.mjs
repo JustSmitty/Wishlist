@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import { startApp } from './helpers.mjs';
-import { cleanText, extractMetadataFromHtml, checkUrlSafety, canonicalizeUrl, parsePriceNumber } from '../src/services/capture.mjs';
+import { cleanText, extractMetadataFromHtml, checkUrlSafety, canonicalizeUrl, parsePriceNumber, cleanPrice, cleanInt } from '../src/services/capture.mjs';
 
 function raw(base, request) {
   const { hostname, port } = new URL(base);
@@ -105,7 +105,18 @@ test('hostile input is processed in linear time', () => {
 test('cleanText returns plain text with no markup, however it was encoded', () => {
   assert.equal(cleanText('&lt;img src=x onerror=alert(1)&gt;Hello'), 'Hello');
   assert.equal(cleanText('&amp;lt;b&amp;gt;bold&amp;lt;/b&amp;gt;'), 'bold');
-  assert.equal(cleanText('<scr<script>ipt>alert(1)</script>'), 'ipt>alert(1)');
+  assert.equal(cleanText('<scr<script>ipt>alert(1)</script>'), '<scr');
+  // Angle brackets used as punctuation are kept; anything that is markup is not.
+  assert.equal(cleanText('Size <Medium> please'), 'Size <Medium> please');
+  assert.equal(cleanText('<Untitled>'), '<Untitled>');
+  for (const markup of ['<Medium onclick=x>', '<svg/onload=alert(1)>', '<x-foo>', '<math><mi>', '<!-- c -->', '<a href=//x>']) {
+    assert.equal(cleanText(markup), '', markup);
+  }
+  // Joiners that spell words and build emoji survive; a cut never leaves half a character.
+  assert.equal(cleanText('\u{1F468}\u200D\u{1F469}\u200D\u{1F467} family'), '\u{1F468}\u200D\u{1F469}\u200D\u{1F467} family');
+  assert.equal(cleanText('\u0645\u06CC\u200C\u062E\u0648\u0627\u0647\u0645'), '\u0645\u06CC\u200C\u062E\u0648\u0627\u0647\u0645');
+  assert.equal(cleanText('ab\u{1F600}', 3), 'ab');
+  assert.equal(cleanText('a\u202Eb\u200Bc'), 'a b c', 'direction overrides and zero-width spaces still go');
   assert.equal(cleanText('5 < 6 and 7 > 3'), '5 < 6 and 7 > 3', 'ordinary comparisons survive');
   assert.equal(cleanText('  a\u0000b\n\tc  '), 'a b c');
   assert.equal(cleanText({ toString: () => 'x' }), '', 'objects are not coerced');
@@ -128,8 +139,15 @@ test('link safety: only public http(s) destinations', () => {
 
 test('prices are parsed as one number, in either decimal convention', () => {
   const cases = { '$399.95': 399.95, '1,299.00': 1299, '1.299,00': 1299, '1 299,00 €': 1299, '74,95': 74.95,
-    '$12.99 - $15.99': 12.99, '20% off was $50 now $40': 50, 'abc': null, '': null };
+    '$12.99 - $15.99': 12.99, '20% off was $50 now $40': 50, 'abc': null, '': null,
+    '1.299 €': 1299, '₹1,29,999': 129999, '€ 2 500': 2500, '0.999': 1, '1,5': 1.5, '1.234.567': 1234567 };
   for (const [input, expected] of Object.entries(cases)) assert.equal(parsePriceNumber(input), expected, input);
+  assert.notEqual(parsePriceNumber('Pack of 2 500 ml'), 2500, 'digits of two different numbers are never joined');
+  // Only plain decimals and numbers are prices; only numbers and numeric strings are counts.
+  for (const bad of ['   ', [], '0x1F', '1e3', true, {}, '-1', '1,5']) assert.equal(cleanPrice(bad), null, JSON.stringify(bad));
+  assert.equal(cleanPrice('24.995'), 25);
+  for (const bad of [null, '', true, [], {}, 'abc']) assert.equal(cleanInt(bad, 1, 999, 42), 42, JSON.stringify(bad));
+  assert.equal(cleanInt('7', 1, 999, 42), 7);
 });
 
 test('CSV export neutralises spreadsheet formulas', async () => {
