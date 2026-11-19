@@ -2130,7 +2130,15 @@ function renderPlaceholderSvg(label, theme) {
 
 // Start the server when run directly.
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(__filename)) {
-  const { server, config } = createApp();
+  let app;
+  try {
+    app = createApp();
+  } catch (err) {
+    // A setting the server refuses to guess at: say which, plainly, and stop.
+    console.error(`Hushlist did not start: ${err.message}`);
+    process.exit(1);
+  }
+  const { server, config } = app;
   const boundLocally = ['127.0.0.1', '::1', 'localhost'].includes(config.host);
   if (config.demoMode && !boundLocally && !config.demoAllowRemote) {
     console.error(
