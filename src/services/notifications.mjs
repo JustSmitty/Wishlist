@@ -123,19 +123,8 @@ export function sendNotification(db, {
     // is not known, nothing is held back: guessing would delay mail by hours
     // for most of the world.
     const zone = db.prepare('SELECT time_zone FROM users WHERE id = ?').get(recipientUserId)?.time_zone;
-    const minuteNow = zone ? minuteOfDayInZone(now, zone) : null;
-    if (minuteNow !== null) {
-      const quietStart = (pref ? pref.quiet_hours_start : 21) * 60;
-      const quietEnd = (pref ? pref.quiet_hours_end : 8) * 60;
-      const inQuietHours = quietStart > quietEnd
-        ? (minuteNow >= quietStart || minuteNow < quietEnd)
-        : (minuteNow >= quietStart && minuteNow < quietEnd);
-      if (inQuietHours) {
-        const minutesUntilEnd = (quietEnd - minuteNow + 1440) % 1440 || 1440;
-        scheduledFor = new Date(now.getTime() + minutesUntilEnd * 60 * 1000);
-        scheduledFor.setUTCSeconds(0, 0);
-      }
-    }
+    const until = zone ? quietHoursEnd(now, zone, pref ? pref.quiet_hours_start : 21, pref ? pref.quiet_hours_end : 8) : null;
+    if (until) scheduledFor = until;
   }
 
   const id = uid('ntf');
@@ -227,6 +216,34 @@ export function isValidTimeZone(timeZone) {
   } catch {
     return false;
   }
+}
+
+/**
+ * When the recipient's quiet hours end, if they are in them now; else null.
+ *
+ * Worked out on the recipient's clock and then checked against it: on the
+ * night the clocks change, "08:00" is an hour nearer or further than the
+ * offset in force at bedtime would say, so the first estimate is corrected
+ * until the local time really reads the end of quiet hours.
+ */
+export function quietHoursEnd(now, zone, startHour, endHour) {
+  const minuteNow = minuteOfDayInZone(now, zone);
+  if (minuteNow === null) return null;
+  const start = startHour * 60;
+  const end = endHour * 60;
+  const quiet = start > end ? (minuteNow >= start || minuteNow < end) : (minuteNow >= start && minuteNow < end);
+  if (!quiet) return null;
+  let candidate = new Date(now.getTime() + (((end - minuteNow + 1440) % 1440) || 1440) * 60_000);
+  for (let i = 0; i < 3; i++) {
+    const local = minuteOfDayInZone(candidate, zone);
+    let diff = end - local;
+    if (diff > 720) diff -= 1440;
+    if (diff < -720) diff += 1440;
+    if (diff === 0) break;
+    candidate = new Date(candidate.getTime() + diff * 60_000);
+  }
+  candidate.setUTCSeconds(0, 0);
+  return candidate.getTime() > now.getTime() ? candidate : null;
 }
 
 /** Minutes since local midnight in the given zone (so :30 and :45 zones are right), or null. */

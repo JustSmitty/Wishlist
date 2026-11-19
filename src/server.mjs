@@ -1,5 +1,7 @@
 import http from 'node:http';
 import net from 'node:net';
+import fs from 'node:fs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createDatabase, uid, secretToken, signInCode, sha256, safeEqual, inTransaction } from './db/schema.mjs';
@@ -69,7 +71,10 @@ const SECURITY_HEADERS = {
     "object-src 'none'",
     "base-uri 'self'",
     "form-action 'self'",
-    "frame-ancestors 'none'"
+    "frame-ancestors 'none'",
+    // Only the app's own escaping template can put markup into the page.
+    "require-trusted-types-for 'script'",
+    'trusted-types hushlist'
   ].join('; ')
 };
 
@@ -86,6 +91,7 @@ export function createApp(customDb = null, options = {}) {
   syncAdmins(db, config.adminEmails);
 
   const limiter = new RateLimiter();
+  const serviceWorker = buildServiceWorker(PUBLIC_DIR);
   let lastPurge = 0;
 
   // Housekeeping that must happen whether or not anyone is using the app:
@@ -133,6 +139,11 @@ export function createApp(customDb = null, options = {}) {
     // "//host/…" and "/\host/…" are addresses on another site as far as a
     // browser is concerned. They are never a page here.
     if (/^[/\\]{2}/.test(req.url) || req.url.includes('\\')) throw notFound('Not found');
+    // Two Host headers: Node uses the first, and a proxy in front may use the
+    // last. Checks that rely on the host would then be looking at the wrong one.
+    let hosts = 0;
+    for (let i = 0; i < req.rawHeaders.length; i += 2) if (req.rawHeaders[i].toLowerCase() === 'host') hosts++;
+    if (hosts > 1) throw badRequest('Malformed request');
     const urlObj = new URL(req.url, 'http://localhost');
     const pathname = urlObj.pathname;
     if (pathname.startsWith('//') || urlObj.host !== 'localhost') throw notFound('Not found');
@@ -1740,56 +1751,67 @@ export function createApp(customDb = null, options = {}) {
       limit(req, 'export', 10);
       const format = urlObj.searchParams.get('format') === 'csv' ? 'csv' : 'json';
 
-      const myLists = db.prepare(`
-        SELECT id, name, occasion, event_date, visibility, surprise_mode, archived_at, created_at
-        FROM lists WHERE owner_id = ?
-      `).all(user.id);
-      const myItems = db.prepare(`
+      // Written out a page of rows at a time, waiting whenever the client is
+      // slower than the server, so an export never sits whole in memory.
+      const PAGE = 500;
+      const pages = function* (sql, ...args) {
+        for (let offset = 0; ; offset += PAGE) {
+          const rows = db.prepare(`${sql} LIMIT ${PAGE} OFFSET ${offset}`).all(...args);
+          if (rows.length) yield rows;
+          if (rows.length < PAGE) return;
+        }
+      };
+      const send = (chunk) => (res.write(chunk) ? null : new Promise(resolve => res.once('drain', resolve)));
+      const itemsSql = `
         SELECT i.title, i.kind, i.store, i.price, i.currency, i.variant, i.qty_wanted, i.priority,
                i.canonical_url, i.notes, i.status, l.name AS list_name
         FROM items i JOIN lists l ON l.id = i.list_id
         WHERE l.owner_id = ? AND i.status NOT IN ('deleted', 'got_it')
-      `).all(user.id);
+        ORDER BY i.rowid`;
       // Only claims this person made for others. Claims ON their own lists are
       // never exported: that would be the surprise.
-      const claimsIMade = db.prepare(`
+      const claimsSql = `
         SELECT c.status, c.qty, c.order_note, c.created_at, i.title AS item_title, i.store, i.price, i.currency, u.name AS recipient_name
         FROM claims c
         JOIN items i ON i.id = c.item_id
         JOIN lists l ON l.id = c.list_id
         JOIN users u ON u.id = l.owner_id
         WHERE c.claimer_user_id = ?
-      `).all(user.id);
+        ORDER BY c.rowid`;
+
+      res.writeHead(200, {
+        'Content-Type': format === 'csv' ? 'text/csv; charset=utf-8' : 'application/json; charset=utf-8',
+        'Content-Disposition': `attachment; filename="hushlist-export.${format}"`,
+        'Cache-Control': 'no-store'
+      });
 
       if (format === 'csv') {
-        const header = 'RecordType,ListOrRecipient,Title,KindOrStatus,Store,Price,Currency,Variant,Qty,Priority,URL,Notes';
-        const lines = [
-          ...myItems.map(i => ['WishlistItem', i.list_name, i.title, i.kind, i.store, i.price ?? '', i.currency, i.variant ?? '', i.qty_wanted, i.priority, i.canonical_url ?? '', i.notes ?? '']),
-          ...claimsIMade.map(c => ['MyClaim', c.recipient_name, c.item_title, c.status, c.store ?? '', c.price ?? '', c.currency || 'USD', '', c.qty, '', '', c.order_note ?? ''])
-        ].map(row => row.map(csvCell).join(','));
-        const csv = [header, ...lines].join('\r\n');
-        res.writeHead(200, {
-          'Content-Type': 'text/csv; charset=utf-8',
-          'Content-Disposition': 'attachment; filename="hushlist-export.csv"',
-          'Cache-Control': 'no-store'
-        });
-        res.end(csv);
+        await send('RecordType,ListOrRecipient,Title,KindOrStatus,Store,Price,Currency,Variant,Qty,Priority,URL,Notes');
+        for (const rows of pages(itemsSql, user.id)) {
+          await send(rows.map(i => '\r\n' + ['WishlistItem', i.list_name, i.title, i.kind, i.store, i.price ?? '', i.currency, i.variant ?? '', i.qty_wanted, i.priority, i.canonical_url ?? '', i.notes ?? ''].map(csvCell).join(',')).join(''));
+        }
+        for (const rows of pages(claimsSql, user.id)) {
+          await send(rows.map(c => '\r\n' + ['MyClaim', c.recipient_name, c.item_title, c.status, c.store ?? '', c.price ?? '', c.currency || 'USD', '', c.qty, '', '', c.order_note ?? ''].map(csvCell).join(',')).join(''));
+        }
+        res.end();
         return;
       }
 
-      const payload = JSON.stringify({
-        exported_at: new Date().toISOString(),
-        user: { id: user.id, name: user.name, email: user.email },
-        lists: myLists,
-        items: myItems,
-        my_claims_for_others: claimsIMade
-      }, null, 2);
-      res.writeHead(200, {
-        'Content-Type': 'application/json; charset=utf-8',
-        'Content-Disposition': 'attachment; filename="hushlist-export.json"',
-        'Cache-Control': 'no-store'
-      });
-      res.end(payload);
+      const myLists = db.prepare(`
+        SELECT id, name, occasion, event_date, visibility, surprise_mode, archived_at, created_at
+        FROM lists WHERE owner_id = ?
+      `).all(user.id);
+      await send(`{\n  "exported_at": ${JSON.stringify(new Date().toISOString())},\n  "user": ${JSON.stringify({ id: user.id, name: user.name, email: user.email })},\n  "lists": ${JSON.stringify(myLists)},\n  "items": [`);
+      let first = true;
+      for (const rows of pages(itemsSql, user.id)) {
+        await send(rows.map(r => `${first ? (first = false, '') : ','}\n    ${JSON.stringify(r)}`).join(''));
+      }
+      await send('\n  ],\n  "my_claims_for_others": [');
+      first = true;
+      for (const rows of pages(claimsSql, user.id)) {
+        await send(rows.map(r => `${first ? (first = false, '') : ','}\n    ${JSON.stringify(r)}`).join(''));
+      }
+      res.end('\n  ]\n}\n');
       return;
     }
 
@@ -2048,6 +2070,15 @@ export function createApp(customDb = null, options = {}) {
     // Front end
     // =========================================================================
     if (!isApi && (method === 'GET' || method === 'HEAD')) {
+      if (pathname === '/sw.js') {
+        res.writeHead(200, {
+          'Content-Type': 'text/javascript; charset=utf-8',
+          'Cache-Control': 'no-cache',
+          'Service-Worker-Allowed': '/'
+        });
+        res.end(method === 'HEAD' ? undefined : serviceWorker);
+        return;
+      }
       if (await serveStatic(req, res, PUBLIC_DIR, pathname)) return;
       throw notFound('Not found');
     }
@@ -2055,12 +2086,30 @@ export function createApp(customDb = null, options = {}) {
     throw notFound('Not found');
   }
 
+  // Requests being worked on per client address. Unlike a connection count
+  // this still means something behind a proxy, where every connection comes
+  // from the proxy but each request names its client.
+  const inFlight = new Map();
+  const MAX_IN_FLIGHT = 24;
+
   async function handleRequest(req, res) {
     for (const [name, value] of Object.entries(SECURITY_HEADERS)) res.setHeader(name, value);
+    // Browsers only keep this over HTTPS; the setting says the site is served that way.
+    if (config.secureCookies) res.setHeader('Strict-Transport-Security', 'max-age=31536000');
+    const who = clientIp(req);
+    const busy = (inFlight.get(who) || 0) + 1;
+    inFlight.set(who, busy);
     try {
+      if (busy > MAX_IN_FLIGHT) {
+        res.setHeader('Retry-After', '2');
+        throw new AppError('Too many requests at once. Try again in a moment.', 503);
+      }
       await route(req, res);
     } catch (err) {
       respondWithError(res, err);
+    } finally {
+      const left = (inFlight.get(who) || 1) - 1;
+      if (left <= 0) inFlight.delete(who); else inFlight.set(who, left);
     }
     // Mail is delivered here, after the work that produced it has been
     // committed (or rolled back, in which case there is nothing to send).
@@ -2081,7 +2130,7 @@ export function createApp(customDb = null, options = {}) {
   // A connection that neither sends nor reads for a minute is closed, so a
   // client that asks for a large page and never reads it cannot make the
   // server hold that page in memory indefinitely.
-  server.setTimeout(60_000, (socket) => socket.destroy());
+  server.setTimeout(config.idleTimeoutMs || 60_000, (socket) => socket.destroy());
   server.maxConnections = 2048;
   const openByAddress = new Map();
   server.on('connection', (socket) => {
@@ -2131,6 +2180,33 @@ function isLoopbackHost(hostHeader) {
   if (typeof hostHeader !== 'string') return false;
   const host = hostHeader.trim().toLowerCase().replace(/:\d{1,5}$/, '');
   return host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
+}
+
+/**
+ * The service worker, with its list of files and its version written in from
+ * what is actually in the public folder. Any change to any of those files
+ * changes the worker, so browsers install it and replace their offline copy
+ * in one piece — never a mix of old and new files.
+ */
+function buildServiceWorker(publicDir) {
+  const files = [];
+  const walk = (dir, prefix) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (entry.name.startsWith('.')) continue;
+      const rel = `${prefix}/${entry.name}`;
+      if (entry.isDirectory()) walk(path.join(dir, entry.name), rel);
+      else if (/\.(js|css|woff2|svg|png|webmanifest|html)$/.test(entry.name) && rel !== '/sw.js') files.push(rel);
+    }
+  };
+  walk(publicDir, '');
+  files.sort();
+  const hash = crypto.createHash('sha256');
+  for (const f of files) hash.update(f).update(fs.readFileSync(path.join(publicDir, f)));
+  const shell = ['/', ...files.filter(f => f !== '/index.html')];
+  const source = fs.readFileSync(path.join(publicDir, 'sw.js'), 'utf8');
+  return source
+    .replace("'__VERSION__'", JSON.stringify(`hushlist-${hash.digest('hex').slice(0, 16)}`))
+    .replace("['__SHELL__']", JSON.stringify(shell));
 }
 
 /** Up to `max` distinct non-empty strings from untrusted input. */

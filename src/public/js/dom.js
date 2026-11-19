@@ -36,8 +36,17 @@ export function raw(trusted) {
   return new SafeHtml(String(trusted));
 }
 
+// The page's Content-Security-Policy requires Trusted Types: the browser
+// refuses to put a plain string into innerHTML. This module-private policy is
+// the one way in, and it is only ever given the output of toHtml(), in which
+// every value has already been escaped by the html`` template.
+const policy = typeof window !== 'undefined' && window.trustedTypes?.createPolicy
+  ? window.trustedTypes.createPolicy('hushlist', { createHTML: (markup) => markup })
+  : null;
+
 export function render(target, content) {
-  target.innerHTML = toHtml(content);
+  const markup = toHtml(content);
+  target.innerHTML = policy ? policy.createHTML(markup) : markup;
 }
 
 /** http(s) and same-site paths only; anything else becomes an inert "#". */

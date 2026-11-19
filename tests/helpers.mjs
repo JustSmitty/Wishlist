@@ -63,5 +63,5 @@ export async function startApp(options = {}) {
     return c;
   }
 
-  return { db, base, guest, as, signUp, client, close: () => new Promise(r => server.close(r)) };
+  return { db, base, server, guest, as, signUp, client, close: () => new Promise(r => server.close(r)) };
 }

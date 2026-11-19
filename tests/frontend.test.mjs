@@ -33,14 +33,19 @@ test('safeUrl allows http(s) and same-site paths only', () => {
   assert.equal(safeUrl('/lists/abc?x=1#top'), '/lists/abc?x=1#top');
 });
 
-test('the offline shell lists every script and stylesheet the app loads', async () => {
-  const fs = await import('node:fs');
-  const path = await import('node:path');
-  const root = new URL('../src/public/', import.meta.url).pathname;
-  const sw = fs.readFileSync(path.join(root, 'sw.js'), 'utf8');
-  const files = [...fs.readdirSync(path.join(root, 'js')).filter(f => f.endsWith('.js')).map(f => `/js/${f}`),
-    ...fs.readdirSync(path.join(root, 'js/views')).map(f => `/js/views/${f}`), '/styles.css'];
-  for (const file of files) assert.ok(sw.includes(`'${file}'`), `${file} is missing from the service worker's shell list`);
+test('the offline shell is generated from the real files and changes when any of them does', async () => {
+  const { startApp } = await import('./helpers.mjs');
+  const app = await startApp();
+  try {
+    const res = await fetch(`${app.base}/sw.js`);
+    const sw = await res.text();
+    assert.equal(res.headers.get('service-worker-allowed'), '/');
+    const shell = JSON.parse(/const SHELL = (\[.*?\]);/.exec(sw)[1]);
+    for (const f of ['/', '/styles.css', '/js/main.js', '/js/app.js', '/js/views/home.js', '/fonts/fraunces-latin.woff2']) assert.ok(shell.includes(f), f);
+    assert.ok(!shell.includes('/sw.js') && !shell.includes('/index.html'));
+    assert.match(sw, /const CACHE = "hushlist-[0-9a-f]{16}";/);
+    for (const f of shell) assert.equal((await fetch(`${app.base}${f}`)).status, 200, `${f} is served`);
+  } finally { await app.close(); }
 });
 
 test('formatting helpers', () => {

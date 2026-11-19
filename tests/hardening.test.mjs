@@ -430,6 +430,7 @@ test('limits hold on every way in: imports and moves cannot overfill a list', ()
 // ------------------------------------------------------------------ web surface
 
 import http from 'node:http';
+import net from 'node:net';
 import { extractMetadataFromHtml, toProxiedImageUrl, recheckItemPriceAndStock } from '../src/services/capture.mjs';
 import { verifyGuestClaim } from '../src/services/claims.mjs';
 
@@ -689,5 +690,67 @@ test('a guest who lost the browser that reserved can get the reservation back wi
     const again = await app.guest.post('/api/claims/recover', { list: 'maya-birthday-2026', email: 'cousin.sam@example.com' });
     for (let i = 0; i < 5; i++) await app.guest.post('/api/claims/recover/verify', { recovery_id: again.json.recovery_id, code: '11111111' });
     assert.equal((await app.guest.post('/api/claims/recover/verify', { recovery_id: again.json.recovery_id, code: again.json.demo_code })).status, 400);
+  } finally { await app.close(); }
+});
+
+test('robustness: quiet hours survive a clock change; duplicate Host headers are refused; one client cannot occupy the server', async () => {
+  const { quietHoursEnd } = await import('../src/services/notifications.mjs');
+  // Berlin, the night the clocks go forward (28 March 2027, 02:00 → 03:00).
+  // At 22:30 local, quiet hours end at 08:00 summer time = 06:00 UTC, not 07:00.
+  assert.equal(quietHoursEnd(new Date('2027-03-27T21:30:00Z'), 'Europe/Berlin', 21, 8).toISOString(), '2027-03-28T06:00:00.000Z');
+  // And the night they go back (31 October 2027): 08:00 winter time = 07:00 UTC.
+  assert.equal(quietHoursEnd(new Date('2027-10-30T20:30:00Z'), 'Europe/Berlin', 21, 8).toISOString(), '2027-10-31T07:00:00.000Z');
+  // A half-hour zone, and a time outside quiet hours.
+  assert.equal(quietHoursEnd(new Date('2027-01-10T17:00:00Z'), 'Asia/Kolkata', 21, 8).toISOString(), '2027-01-11T02:30:00.000Z');
+  assert.equal(quietHoursEnd(new Date('2027-01-10T12:00:00Z'), 'Europe/Berlin', 21, 8), null);
+
+  const app = await startApp({ secureCookies: true });
+  try {
+    const twoHosts = await new Promise((resolve) => {
+      const s = net.connect(new URL(app.base).port, '127.0.0.1', () => s.write('GET /api/session HTTP/1.1\r\nHost: 127.0.0.1\r\nHost: evil.example\r\nConnection: close\r\n\r\n'));
+      let out = ''; s.on('data', d => { out += d; }); s.on('close', () => resolve(out));
+    });
+    assert.match(twoHosts, /^HTTP\/1\.1 400/);
+
+    const headers = (await app.guest.get('/api/session')).headers;
+    assert.equal(headers.get('strict-transport-security'), 'max-age=31536000');
+    assert.match(headers.get('content-security-policy'), /require-trusted-types-for 'script'; trusted-types hushlist/);
+
+    // 24 requests that never finish sending their body are being worked on;
+    // the 25th from the same address is turned away, and is answered.
+    const port = new URL(app.base).port;
+    const stalled = [];
+    for (let i = 0; i < 24; i++) {
+      const s = net.connect(port, '127.0.0.1');
+      s.on('error', () => {});
+      s.write('POST /api/claims HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n{"item');
+      stalled.push(s);
+    }
+    await new Promise(r => setTimeout(r, 300));
+    const turnedAway = await app.guest.get('/api/session');
+    assert.equal(turnedAway.status, 503);
+    assert.equal(turnedAway.headers.get('retry-after'), '2');
+    for (const s of stalled) s.destroy();
+    await new Promise(r => setTimeout(r, 300));
+    assert.equal((await app.guest.get('/api/session')).status, 200, 'and served again once they are gone');
+  } finally { await app.close(); }
+});
+
+test('export: streamed in pages, still one valid document, and never what others reserved for you', async () => {
+  const app = await startApp();
+  try {
+    const insert = app.db.prepare("INSERT INTO items (id, list_id, title, created_at, updated_at) VALUES (?, 'lst_justin_holiday', ?, ?, ?)");
+    const nowIso = new Date().toISOString();
+    for (let i = 0; i < 1203; i++) insert.run(`itm_bulk_${i}`, `Bulk "wish" ${i}`, nowIso, nowIso);
+    const justin = await app.as('usr_justin');
+    const json = JSON.parse((await justin.get('/api/export?format=json')).text);
+    assert.ok(json.items.length >= 1203);
+    assert.ok(json.items.some(i => i.title === 'Bulk "wish" 1202'));
+    assert.ok(json.my_claims_for_others.length >= 1, 'his own reservations for others are in it');
+    assert.ok(json.my_claims_for_others.every(c => c.recipient_name !== 'Justin Smith'), 'reservations on his own lists are not');
+    assert.ok(!JSON.stringify(json).includes('REI #98112'), "and nothing from the giver's private note on his list");
+    const csv = (await justin.get('/api/export?format=csv')).text.split('\r\n');
+    assert.ok(csv.length >= 1204);
+    assert.equal(csv[0], 'RecordType,ListOrRecipient,Title,KindOrStatus,Store,Price,Currency,Variant,Qty,Priority,URL,Notes');
   } finally { await app.close(); }
 });
