@@ -83,7 +83,9 @@ export function loadConfig(env = process.env) {
     port,
     publicUrl: base,
     host: env.HOST || (demoMode ? '127.0.0.1' : '0.0.0.0'),
-    secureCookies: parseSwitch('HUSHLIST_SECURE_COOKIES', env.HUSHLIST_SECURE_COOKIES) === true,
+    // Served over HTTPS (the public address says so) means secure cookies,
+    // unless explicitly turned off.
+    secureCookies: parseSwitch('HUSHLIST_SECURE_COOKIES', env.HUSHLIST_SECURE_COOKIES) ?? Boolean(base && base.startsWith('https://')),
     trustProxy: parseSwitch('HUSHLIST_TRUST_PROXY', env.HUSHLIST_TRUST_PROXY) === true,
     adminEmails: new Set(
       String(env.HUSHLIST_ADMIN_EMAILS || '')

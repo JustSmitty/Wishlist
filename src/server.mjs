@@ -249,6 +249,13 @@ export function createApp(customDb = null, options = {}) {
 
     if (isApi) purgeIfDue();
 
+    // For a hosting platform's health check: the process answers and the
+    // database can be read. Says nothing else.
+    if (pathname === '/api/health' && (method === 'GET' || method === 'HEAD')) {
+      db.prepare('SELECT 1').get();
+      return sendJson(res, 200, { ok: true });
+    }
+
     // =========================================================================
     // Placeholder artwork and share target
     // =========================================================================
@@ -2490,6 +2497,30 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(__filename
     );
     process.exit(1);
   }
+  // Platforms stop a container with SIGTERM. Finish what is in progress,
+  // close the database cleanly, then exit; give up after ten seconds.
+  let stopping = false;
+  for (const signal of ['SIGTERM', 'SIGINT']) {
+    process.on(signal, () => {
+      if (stopping) return;
+      stopping = true;
+      console.log(`${signal} received: stopping`);
+      app.stop();
+      server.close(() => {
+        try { app.db.close(); } catch { /* already closed */ }
+        process.exit(0);
+      });
+      server.closeIdleConnections?.();
+      setTimeout(() => process.exit(0), 10_000).unref();
+    });
+  }
+  if (!config.demoMode && config.mailTransport !== 'smtp') {
+    console.warn('WARNING: no email provider is configured. Sign-in codes and guest verification codes are not delivered to anyone. Set HUSHLIST_SMTP_HOST and HUSHLIST_MAIL_FROM.');
+  }
+  if (!config.demoMode && !config.publicUrl) {
+    console.warn('WARNING: HUSHLIST_PUBLIC_URL is not set. Set it to the https:// address people use, so cookies are marked Secure and Google sign-in can work.');
+  }
+
   server.listen(config.port, config.host, () => {
     const shown = config.host === '0.0.0.0' ? 'localhost' : config.host;
     console.log(`Hushlist is running at http://${shown}:${config.port}`);
