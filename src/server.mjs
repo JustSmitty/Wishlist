@@ -1,4 +1,5 @@
 import http from 'node:http';
+import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createDatabase, uid, secretToken, sha256, safeEqual, inTransaction } from './db/schema.mjs';
@@ -39,6 +40,8 @@ const VISIBILITIES = ['private', 'specific', 'link'];
 const PRIORITIES = ['most_wanted', 'high', 'normal', 'low'];
 const KINDS = ['product', 'experience', 'cash', 'idea'];
 const MAX_ITEMS_PER_LIST = 500;
+const MAX_LISTS_PER_OWNER = 60;
+const MAX_CONNECTIONS_PER_ADDRESS = 64;
 const API_TOKEN_ROUTES = new Set(['GET /api/session', 'GET /api/lists', 'POST /api/capture', 'POST /api/items']);
 const EXTENSION_ORIGIN = /^(chrome-extension|moz-extension|safari-web-extension):\/\/[a-z0-9-]+$/i;
 
@@ -95,8 +98,10 @@ export function createApp(customDb = null, options = {}) {
 
   function clientIp(req) {
     if (config.trustProxy) {
-      const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
-      if (forwarded) return forwarded;
+      // The last entry is the one the trusted proxy added. Earlier entries are
+      // whatever the client chose to send, so they are never used as identity.
+      const forwarded = String(req.headers['x-forwarded-for'] || '').split(',').pop().trim();
+      if (net.isIP(forwarded)) return forwarded;
     }
     return req.socket?.remoteAddress || 'unknown';
   }
@@ -118,8 +123,12 @@ export function createApp(customDb = null, options = {}) {
   }
 
   async function route(req, res) {
+    // "//host/…" and "/\host/…" are addresses on another site as far as a
+    // browser is concerned. They are never a page here.
+    if (/^[/\\]{2}/.test(req.url) || req.url.includes('\\')) throw notFound('Not found');
     const urlObj = new URL(req.url, 'http://localhost');
     const pathname = urlObj.pathname;
+    if (pathname.startsWith('//') || urlObj.host !== 'localhost') throw notFound('Not found');
     const method = req.method;
     const isApi = pathname.startsWith('/api/');
 
@@ -165,19 +174,34 @@ export function createApp(customDb = null, options = {}) {
     if (bearerSession && !API_TOKEN_ROUTES.has(`${method} ${pathname}`)) {
       throw forbidden('This token can only be used to add wishes to your lists');
     }
-    const guestToken = typeof req.headers['x-guest-token'] === 'string'
-      ? req.headers['x-guest-token'].slice(0, 200)
-      : null;
+    // Manage tokens for reservations made as a guest in this browser (one per
+    // reservation). They speak for a guest only: once someone is signed in
+    // they are ignored, so a token left behind on a shared computer does not
+    // hand the next person someone else's reservation.
+    const presentedTokens = !currentUser && typeof req.headers['x-guest-token'] === 'string'
+      ? req.headers['x-guest-token'].split(',').map(t => t.trim()).filter(t => t && t.length <= 100).slice(0, 25)
+      : [];
+    const guestToken = presentedTokens.length ? presentedTokens : null;
 
     // ----- Cross-site request forgery ----------------------------------------
     // SameSite=Lax already withholds the cookie from cross-site POSTs, and the
     // JSON content-type requirement forces a preflight that is never granted.
     // The Origin comparison is a third, independent check.
+    // It applies to every write a browser sends from another site, with or
+    // without a session: signing out, for one, needs no cookie to do damage.
+    // The extension is the exception, and only with its own token.
     const isWrite = !['GET', 'HEAD'].includes(method);
-    if (isWrite && viaCookie && origin) {
+    if (isWrite && origin && !(bearerSession && EXTENSION_ORIGIN.test(origin))) {
       let originHost = null;
-      try { originHost = new URL(origin).host; } catch { /* malformed */ }
+      try { originHost = new URL(origin).host; } catch { /* malformed, or "null" */ }
       if (originHost !== req.headers.host) throw forbidden('Cross-site request refused');
+    }
+
+    // General ceilings, generous for a person and tight for a script. Reads
+    // that assemble a lot of data and every write are counted per address.
+    if (isApi) {
+      if (isWrite) limit(req, 'writes', 240);
+      else limit(req, 'reads', 600);
     }
 
     const requireUser = () => {
@@ -216,8 +240,10 @@ export function createApp(customDb = null, options = {}) {
     }
 
     if (pathname === '/share-target' && method === 'GET') {
-      const sharedUrl = (urlObj.searchParams.get('url') || urlObj.searchParams.get('text') || '').slice(0, 2048);
-      const sharedTitle = (urlObj.searchParams.get('title') || '').slice(0, 300);
+      // toWellFormed: cutting by length can split a character in two, which
+      // encodeURIComponent refuses to encode.
+      const sharedUrl = (urlObj.searchParams.get('url') || urlObj.searchParams.get('text') || '').slice(0, 2048).toWellFormed();
+      const sharedTitle = (urlObj.searchParams.get('title') || '').slice(0, 300).toWellFormed();
       res.writeHead(302, {
         Location: `/?sharedUrl=${encodeURIComponent(sharedUrl)}&sharedTitle=${encodeURIComponent(sharedTitle)}`
       });
@@ -351,7 +377,11 @@ export function createApp(customDb = null, options = {}) {
     // Guardian creates a profile for a child. The child has no email or sign-in.
     if (pathname === '/api/dependents' && method === 'POST') {
       const user = requireUser();
+      limit(req, 'dependents', 10);
       const b = await body();
+      if (db.prepare('SELECT COUNT(*) AS n FROM guardian_links WHERE guardian_id = ?').get(user.id).n >= 20) {
+        throw conflict('You can look after up to 20 child profiles');
+      }
       const childName = cleanText(b.name, 80);
       if (!childName) throw badRequest("Enter the child's name");
       if (b.co_guardian_id && !canNameAsCollaborator(db, user.id, b.co_guardian_id)) {
@@ -426,6 +456,10 @@ export function createApp(customDb = null, options = {}) {
       }
       const name = cleanText(b.name, 120);
       if (!name) throw badRequest('Give the list a name');
+      limit(req, 'list-create', 20);
+      if (db.prepare('SELECT COUNT(*) AS n FROM lists WHERE owner_id = ?').get(ownerId).n >= MAX_LISTS_PER_OWNER) {
+        throw conflict(`A person can have up to ${MAX_LISTS_PER_OWNER} lists. Reopen an archived one instead of starting another.`);
+      }
       const visibility = VISIBILITIES.includes(b.visibility) ? b.visibility : 'link';
       const eventDate = b.event_date ? futureDateOrThrow(b.event_date) : null;
 
@@ -809,6 +843,7 @@ export function createApp(customDb = null, options = {}) {
     const priceMatch = pathname.match(/^\/api\/items\/([^/]{1,100})\/recheck$/);
     if (priceMatch && method === 'POST') {
       const user = requireUser();
+      limit(req, 'recheck', 30);
       const item = db.prepare('SELECT * FROM items WHERE id = ?').get(decodeSegment(priceMatch[1]));
       if (!item) throw notFound('Item not found');
       const itsList = getList(item.list_id);
@@ -1058,6 +1093,8 @@ export function createApp(customDb = null, options = {}) {
     // =========================================================================
     if (pathname === '/api/dashboard' && method === 'GET') {
       const user = requireUser();
+      limit(req, 'dashboard', 60);
+      const nowIso = new Date().toISOString();
 
       const candidates = db.prepare(`
         SELECT DISTINCT u.id, u.name, u.birthday_month, u.birthday_day, u.is_dependent
@@ -1083,21 +1120,39 @@ export function createApp(customDb = null, options = {}) {
           const topPriorities = [];
 
           for (const l of db.prepare('SELECT * FROM lists WHERE owner_id = ? AND archived_at IS NULL ORDER BY created_at ASC').all(person.id)) {
-            const formatted = listDetail(l, user.id);
-            // Lists the viewer co-owns are theirs, not somewhere to shop.
-            if (!formatted || formatted.viewer_role === 'owner') continue;
+            const ctx = getViewerRole(db, l, user.id);
+            // Lists the viewer co-owns are theirs, not somewhere to shop. A
+            // stranger's view by link is not listed here either.
+            if (!ctx.canView || ctx.role === 'owner' || ctx.role === 'guest') continue;
+            // Counted in one query per list; the full list is built only when
+            // someone opens it.
+            const rows = db.prepare(`
+              SELECT i.id, i.title, i.price, i.store, i.kind, i.priority, i.qty_wanted, i.always_wanted, i.allow_group_chip_in,
+                (SELECT COALESCE(SUM(c.qty), 0) FROM claims c
+                  WHERE c.item_id = i.id AND c.verified = 1 AND c.status IN ('reserved', 'purchased', 'given')
+                    AND (c.status != 'reserved' OR c.expires_at IS NULL OR c.expires_at > ?)) AS claimed,
+                (SELECT COALESCE(SUM(p.pledged_amount), 0) FROM contributions p
+                  WHERE p.item_id = i.id AND p.status IN ('pledged', 'paid_off_platform')) AS pledged
+              FROM items i
+              WHERE i.list_id = ? AND i.status = 'active'
+              ORDER BY CASE i.priority WHEN 'most_wanted' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END ASC, i.sort_order ASC
+              LIMIT ${MAX_ITEMS_PER_LIST}
+            `).all(nowIso, l.id);
             let open = 0;
-            for (const it of formatted.items) {
-              if (it.status !== 'active' || it.claim_summary?.is_fully_claimed) continue;
+            for (const it of rows) {
+              const taken = !it.always_wanted && (
+                it.claimed >= it.qty_wanted || (it.allow_group_chip_in && it.price > 0 && it.pledged >= it.price)
+              );
+              if (taken) continue;
               open++;
-              if (it.priority === 'most_wanted' || it.priority === 'high') {
+              if ((it.priority === 'most_wanted' || it.priority === 'high') && topPriorities.length < 3) {
                 topPriorities.push({ id: it.id, title: it.title, price: it.price, store: it.store, kind: it.kind, priority: it.priority, list_id: l.id });
               }
             }
             unclaimedCount += open;
             lists.push({
-              id: formatted.id, name: formatted.name, occasion: formatted.occasion, event_date: formatted.event_date,
-              item_count: formatted.items.filter(i => i.status === 'active').length, unclaimed_count: open
+              id: l.id, name: l.name, occasion: l.occasion, event_date: l.event_date,
+              item_count: rows.length, unclaimed_count: open
             });
           }
 
@@ -1323,6 +1378,7 @@ export function createApp(customDb = null, options = {}) {
         for (const id of recipients) {
           sendNotification(db, {
             recipientUserId: id,
+            aboutUserId: user.id,
             eventType: 'new_follower',
             subject: status === 'pending' ? `Someone asked to follow ${owner.is_dependent ? owner.name : 'you'}` : `You have a new follower`,
             body: status === 'pending'
@@ -1439,6 +1495,7 @@ export function createApp(customDb = null, options = {}) {
 
     if (pathname === '/api/export' && method === 'GET') {
       const user = requireUser();
+      limit(req, 'export', 10);
       const format = urlObj.searchParams.get('format') === 'csv' ? 'csv' : 'json';
 
       const myLists = db.prepare(`
@@ -1779,6 +1836,23 @@ export function createApp(customDb = null, options = {}) {
   server.headersTimeout = 15_000;
   server.keepAliveTimeout = 5_000;
   server.maxRequestsPerSocket = 1000;
+  // A connection that neither sends nor reads for a minute is closed, so a
+  // client that asks for a large page and never reads it cannot make the
+  // server hold that page in memory indefinitely.
+  server.setTimeout(60_000, (socket) => socket.destroy());
+  server.maxConnections = 2048;
+  const openByAddress = new Map();
+  server.on('connection', (socket) => {
+    const address = socket.remoteAddress || 'unknown';
+    const open = (openByAddress.get(address) || 0) + 1;
+    openByAddress.set(address, open);
+    socket.on('close', () => {
+      const left = (openByAddress.get(address) || 1) - 1;
+      if (left <= 0) openByAddress.delete(address); else openByAddress.set(address, left);
+    });
+    // Behind a trusted proxy every connection comes from the proxy's address.
+    if (open > MAX_CONNECTIONS_PER_ADDRESS && !config.trustProxy) socket.destroy();
+  });
   server.on('close', () => clearInterval(housekeepingTimer));
 
   return { server, db, handleRequest, config, housekeeping, stop: () => clearInterval(housekeepingTimer) };
@@ -1792,7 +1866,13 @@ function respondWithError(res, err) {
       return;
     }
     if (err instanceof AppError) {
-      return sendJson(res, err.status, { error: err.message, ...(err.extra || {}) });
+      const { closeConnection, ...extra } = err.extra || {};
+      if (closeConnection) {
+        // The rest of the request was not read; answer, then drop the connection.
+        res.once('finish', () => res.socket?.destroy());
+        return sendJson(res, err.status, { error: err.message, ...extra }, { Connection: 'close' });
+      }
+      return sendJson(res, err.status, { error: err.message, ...extra });
     }
     if (err instanceof TypeError && /Invalid URL/i.test(err.message)) {
       return sendJson(res, 400, { error: 'Malformed request' });
@@ -1840,6 +1920,7 @@ function notifyNamed(db, actor, listName, userIds, role) {
   for (const id of userIds) {
     sendNotification(db, {
       recipientUserId: id,
+      aboutUserId: actor.id,
       eventType: 'added_to_list',
       subject: 'You were added to a wishlist',
       body: `${actor.name} named you as ${role} of "${listName}". If you would rather not be, open My lists (or the list itself) and choose "Leave this list".`

@@ -350,16 +350,24 @@ test('Secret Santa: organizers only, fair draws, no dictated pairings, one live 
     assert.ok(!pairs.some(p => (p.g === 'usr_justin' && p.r === 'usr_maya') || (p.g === 'usr_maya' && p.r === 'usr_justin')));
   }
 
-  // Someone closing their account does not leave a hole in the draw.
-  db.prepare("INSERT INTO users (id, name, email, created_at) VALUES ('usr_fifth', 'Fifth', 'fifth@example.com', ?)").run(new Date().toISOString());
-  db.prepare("INSERT INTO group_members (group_id, user_id, role, joined_at) VALUES ('grp_smith', 'usr_fifth', 'member', ?)").run(new Date().toISOString());
-  const five = draw();
-  deleteAccount(db, 'usr_fifth');
-  const after = pairsOf(five.id);
-  assert.equal(after.length, 4);
-  assert.deepEqual(after.map(p => p.g).sort(), after.map(p => p.r).sort(), 'everyone still gives once and receives once');
-  for (const p of after) assert.notEqual(p.g, p.r);
-  assert.ok(!JSON.stringify(after).includes('usr_fifth'));
+  // Someone closing their account does not leave a hole in the draw — including
+  // when they and one other person had drawn each other.
+  let mutualSeen = 0;
+  for (let round = 0; round < 40; round++) {
+    const id = `usr_fifth_${round}`;
+    db.prepare('INSERT INTO users (id, name, email, created_at) VALUES (?, ?, ?, ?)').run(id, 'Fifth', `fifth${round}@example.com`, new Date().toISOString());
+    db.prepare("INSERT INTO group_members (group_id, user_id, role, joined_at) VALUES ('grp_smith', ?, 'member', ?)").run(id, new Date().toISOString());
+    const five = draw();
+    const before = pairsOf(five.id);
+    if (before.find(p => p.g === id).r === before.find(p => p.r === id).g) mutualSeen++;
+    deleteAccount(db, id);
+    const after = pairsOf(five.id);
+    assert.equal(after.length, 4);
+    assert.deepEqual(after.map(p => p.g).sort(), after.map(p => p.r).sort(), 'everyone still gives once and receives once');
+    for (const p of after) assert.notEqual(p.g, p.r);
+    assert.ok(!JSON.stringify(after).includes(id));
+  }
+  assert.ok(mutualSeen > 0, 'the mutual-pair case was exercised');
 
   const app = await startApp();
   try {

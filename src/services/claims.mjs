@@ -22,10 +22,10 @@
 import { uid, secretToken, sixDigitCode, safeEqual, inTransaction } from '../db/schema.mjs';
 import { AppError, badRequest, forbidden, notFound, conflict } from '../errors.mjs';
 import { sendNotification } from './notifications.mjs';
-import { getViewerRole, ownerCanSeeClaims, safeJsonParse } from './surprise.mjs';
+import { getViewerRole, ownerCanSeeClaims, safeJsonParse, holdsManageToken } from './surprise.mjs';
 import { cleanText, cleanPrice, cleanInt, cleanDate, canonicalizeUrl } from './capture.mjs';
 
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const EMAIL_RE = /^[^\s@\x00-\x1f\x7f]+@[^\s@\x00-\x1f\x7f]+\.[^\s@\x00-\x1f\x7f]+$/;
 const MAX_VERIFY_ATTEMPTS = 5;
 const PRIORITIES = ['most_wanted', 'high', 'normal', 'low'];
 
@@ -336,6 +336,14 @@ export function verifyGuestClaim(db, { claimId, code }) {
     if (!item || !list || list.archived_at || !getViewerRole(db, list, null).canView) {
       return close('List or item no longer available at verification', notFound('That item is no longer available'));
     }
+    // The address has just been proved, so this can be said: it belongs to
+    // someone who owns the list, and owners do not reserve their own wishes.
+    const ownerEmails = [list.owner_id, ...safeJsonParse(list.co_owner_ids, [])]
+      .map(id => db.prepare('SELECT email FROM users WHERE id = ?').get(id)?.email)
+      .filter(Boolean).map(normalizeEmailForCap);
+    if (ownerEmails.includes(normalizeEmailForCap(claim.guest_email))) {
+      return close('Address belongs to an owner of the list', forbidden('You cannot reserve items on your own list'));
+    }
 
     if (!item.always_wanted && activeQuantity(db, item.id) + claim.qty > item.qty_wanted) {
       return close('Item was taken before verification', conflict('Someone else reserved this while you were verifying'));
@@ -411,7 +419,7 @@ export function transitionClaimState(db, {
     const isClaimer = Boolean(
       (actor && claim.claimer_user_id === actor.id) ||
       // A manage token only ever speaks for a guest claim.
-      (!claim.claimer_user_id && manageToken && safeEqual(claim.manage_token, manageToken))
+      (!claim.claimer_user_id && holdsManageToken(claim.manage_token, manageToken))
     );
 
     let actorType = null;
@@ -788,7 +796,10 @@ export function markItemReceived(db, { itemId, actorId, outsideApp = false }) {
  * are kept. Each person gets one message naming everything of theirs that was
  * affected; addresses that never confirmed a code get none.
  */
-export function archiveList(db, list, { reason = 'the list was archived' } = {}) {
+export function archiveList(db, list, { reason = 'the list was archived', label = null } = {}) {
+  // `label` replaces the list's name in the message (used when the name itself
+  // is personal data that is about to be erased).
+  const named = label || `"${list.name}"`;
   return inTransaction(db, () => {
     const nowIso = new Date().toISOString();
     db.prepare('UPDATE lists SET archived_at = COALESCE(archived_at, ?) WHERE id = ?').run(nowIso, list.id);
@@ -828,8 +839,11 @@ export function archiveList(db, list, { reason = 'the list was archived' } = {})
         recipientEmail: person.email,
         eventType: 'claimed_item_withdrawn',
         listId: list.id,
-        subject: `"${list.name}" was closed`,
-        body: `"${list.name}" was closed because ${reason}. Anything you had already marked as bought is still in your gifts.\n${person.lines.join('\n')}`
+        // With a neutral label the message names nobody, so it is kept when
+        // the list's owner is erased.
+        aboutUserId: label ? false : null,
+        subject: `${named.charAt(0).toUpperCase()}${named.slice(1)} was closed`,
+        body: `${named.charAt(0).toUpperCase()}${named.slice(1)} was closed because ${reason}. Anything you had already marked as bought is still in your gifts.\n${person.lines.join('\n')}`
       });
     }
   });

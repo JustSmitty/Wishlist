@@ -51,7 +51,11 @@ async function call(path, { method = 'GET', body } = {}) {
   }
   let data = null;
   try { data = await res.json(); } catch { /* not JSON */ }
-  if (!res.ok) throw new Error(data?.error || `Hushlist answered ${res.status}`);
+  if (!res.ok) {
+    const err = new Error(data?.error || `Hushlist answered ${res.status}`);
+    err.duplicate = Boolean(data?.duplicate_detected);
+    throw err;
+  }
   return data;
 }
 
@@ -157,14 +161,32 @@ $('settings').addEventListener('submit', async (event) => {
   try {
     const url = new URL($('set-server').value.trim());
     if (!['http:', 'https:'].includes(url.protocol)) throw new Error('bad scheme');
+    // "http://trusted-name@other-host/" goes to other-host. The token must
+    // only ever be sent to the host the person can see they typed.
+    if (url.username || url.password) {
+      return setStatus('Enter the address without a user name or "@".', 'err');
+    }
+    const local = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+    if (url.protocol === 'http:' && !local) {
+      return setStatus('Use an https:// address. Plain http:// is only accepted for this computer (localhost).', 'err');
+    }
     server = url.origin;
+    $('set-server').value = server; // show exactly where the token will go
   } catch {
-    return setStatus('Enter the address as http://… or https://…', 'err');
+    return setStatus('Enter the address as https://… (or http://localhost:…)', 'err');
   }
   config = { server, token: $('set-token').value.trim() };
   await saveConfig(config);
   await showSave();
 });
+
+// Set after the server says the item is already on a list; the next press adds it anyway.
+let addAnyway = false;
+const resetAddAnyway = () => {
+  addAnyway = false;
+  $('save').querySelector('button[type="submit"]').textContent = 'Add to list';
+};
+for (const id of ['ext-title', 'ext-list']) $(id).addEventListener('input', resetAddAnyway);
 
 $('save').addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -185,12 +207,20 @@ $('save').addEventListener('submit', async (event) => {
         priority: $('ext-priority').value,
         notes: $('ext-notes').value.trim(),
         image: captured.image || null,
-        field_confidence: captured.confidence || undefined
+        field_confidence: captured.confidence || undefined,
+        ...(addAnyway ? { force_duplicate: true } : {})
       }
     });
+    resetAddAnyway();
     setStatus('Added to your list.', 'ok');
   } catch (err) {
-    setStatus(err.message, 'err');
+    if (err.duplicate) {
+      addAnyway = true;
+      if (button) button.textContent = 'Add anyway';
+      setStatus(`${err.message} Press "Add anyway" if you want it twice.`, 'err');
+    } else {
+      setStatus(err.message, 'err');
+    }
   } finally {
     if (button) button.disabled = false;
   }

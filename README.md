@@ -20,12 +20,12 @@ npm test
 
 ## Demo mode
 
-Demo mode is **on by default** unless `NODE_ENV=production` or `HUSHLIST_DEMO=0` is set. In demo mode:
+Demo mode is **on by default** unless `NODE_ENV=production` or `HUSHLIST_DEMO=0` is set. With `NODE_ENV=production` demo mode cannot be turned on at all: the server refuses to start if both are set. In demo mode:
 
 - A sample family (the Smiths) is loaded so there is something to look at.
 - The welcome page offers one-click sign-in as any sample person, and a "Switch person" control stays visible. The same list looks different to its owner, to family, and to a guest with the link — that is the point of the demo.
 - Sign-in codes and guest verification codes are shown in the app, because no email is sent.
-- The server listens on `127.0.0.1` only, refuses to start on any other address, and only answers requests addressed to `localhost` or `127.0.0.1`. One-click sign-in means anyone who can reach the server can be anyone, so it must not be reachable from another machine or through another site.
+- The server listens on `127.0.0.1` only, refuses to start on any other address, and only answers requests addressed to `localhost` or `127.0.0.1`. Requests that carry proxy headers (`Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, `X-Real-IP`) are refused too, so putting a reverse proxy in front of a demo-mode server does not publish it. One-click sign-in means anyone who can reach the server can be anyone, so it must not be reachable from another machine or through another site.
 
 Do not expose a demo-mode server to a network.
 
@@ -36,19 +36,21 @@ Do not expose a demo-mode server to a network.
 | `PORT` | `3456` | Port to listen on. |
 | `HOST` | `127.0.0.1` in demo mode, otherwise `0.0.0.0` | Address to bind. |
 | `HUSHLIST_DB` | `data/hushlist.sqlite` | Database file. |
-| `HUSHLIST_DEMO` | on unless `NODE_ENV=production` | `0` turns demo mode off, `1` forces it on. |
+| `HUSHLIST_DEMO` | on unless `NODE_ENV=production` | `0` turns demo mode off, `1` turns it on (refused together with `NODE_ENV=production`). |
 | `HUSHLIST_DEMO_ALLOW_REMOTE` | off | `1` lets a demo-mode server bind to and answer on non-local addresses. Avoid: in demo mode anyone who can reach it can sign in as anyone. |
-| `HUSHLIST_ADMIN_EMAILS` | none | Comma-separated addresses that become administrators when they sign in. |
+| `HUSHLIST_ADMIN_EMAILS` | none | Comma-separated addresses of the administrators. When set, this list decides: an address on it becomes an administrator, and an account whose address is taken off it loses the role (and is signed out) the next time the server starts. When empty, nothing is changed. |
 | `HUSHLIST_SECURE_COOKIES` | off | `1` adds `Secure` to the session cookie. Set it when serving over HTTPS. |
-| `HUSHLIST_TRUST_PROXY` | off | `1` takes the client address from `X-Forwarded-For` (only behind a proxy you control). |
+| `HUSHLIST_TRUST_PROXY` | off | `1` takes the client address from the last entry of `X-Forwarded-For`, which is the one your own proxy adds (only behind a proxy you control; earlier entries are whatever the client sent and are ignored). |
 | `HUSHLIST_MAIL_TRANSPORT` | `console` outside demo mode | `console` writes outgoing messages to the server log; `none` keeps them in the database only. |
 | `HUSHLIST_BLOCKED_DOMAINS` | none | Extra comma-separated domains to refuse as links. |
+
+On/off settings accept `1`, `true`, `on`, `yes` and `0`, `false`, `off`, `no`. Any other value stops the server at start-up rather than being guessed at.
 
 ## What is not built yet
 
 These are stated here so nobody is surprised by them:
 
-- **Email.** There is no email provider. Messages are stored in an outbox (visible under Inbox) and, outside demo mode, written to the server log. Until a provider is connected through `setMailTransport()` in `src/services/notifications.mjs`, sign-in outside demo mode depends on someone reading that log.
+- **Email.** There is no email provider. Messages are stored in an outbox (visible under Inbox) and, outside demo mode, written to the server log. Until a provider is connected through `setMailTransport()` in `src/services/notifications.mjs`, sign-in outside demo mode depends on someone reading that log. Sign-in and verification codes are handed to the transport and never stored or shown in the Inbox. Other messages are delivered by a dispatcher that runs after each request and once a minute; messages that can wait are held during the recipient's night (9 pm to 8 am in the time zone their browser reports) and sent when it ends.
 - **Reading product pages.** The server never requests a shop's page. Pasting a link fills in what can be worked out from the link itself; the rest is typed by hand or sent by the browser extension, which reads the page you already have open.
 - **Product photos.** Images from other sites are not loaded or proxied. Each wish gets generated wrapping-paper artwork instead.
 - **Payments.** Group gifts track pledges only. No money moves through Hushlist.
@@ -58,10 +60,38 @@ These are stated here so nobody is surprised by them:
 - While a list is in surprise mode and has not been opened, its owner and co-owners receive no claim data: the response is built without querying claims at all.
 - Anything an owner can do to an item returns the same answer whether or not the item has been reserved.
 - Surprise mode can only be switched off while a list is still empty, and items cannot be moved from a sealed list to an open one.
-- A list can be opened a week after its date. The server decides that from the stored date; there is no override. Everyone who reserved something is told when it happens.
-- Administrators do not see reservations on their own sealed lists.
+- A list can be opened a week after its date. The server decides that from stored dates; there is no override. Everyone who reserved something is told when it happens.
+- The opening date only ever moves later. Changing the date of a sealed list, reopening an archived one, or moving an item onto another sealed list never brings an opening forward: the list opens no sooner than it had already promised, and at least a week after the change.
+- Only the list's owner (a guardian, for a child's list) can open it, choose its helper and co-owners, or change who can see it. A helper is never someone who owns the list.
+- Administrators do not see reservations on their own sealed lists, in the audit log or in the activity feed.
 
-One limit is inherent to link sharing: a list shared by link shows "taken" marks to anyone holding the link, without names. An owner who signs out and opens their own link can therefore see which items are taken, though not by whom. Lists shared only with circles do not have this property.
+Two limits are inherent to the design and are stated plainly:
+
+- **Link sharing shows availability.** Anyone holding a list's link sees which items are still available and how many are left (never who took them, and never pledges or amounts), because that is what stops two guests buying the same thing. An owner who opens their own link while signed out can therefore see which items are taken, though not by whom. Because the owner decides how a list is shared, this applies to any list they choose to share by link, including one they switch to link sharing for the purpose. A list id is not a link: only the share link opens a list for someone with no other connection to it, and taking a list off link sharing retires that link.
+- **Small Secret Santa draws leak by arithmetic.** Each person sees only their own recipient, exclusions are shown to everyone in the draw, every allowed outcome is equally likely, and a set of exclusions is refused if it would let anyone work out the whole draw from their own pairing. In a group of four or five, knowing your own recipient and the exclusions can still narrow down part of the rest (two couples who cannot draw their partners is the plain example). That is a property of small draws, not something the software can remove.
+
+## People, circles and blocking
+
+- **Circles.** The invite code is shown to organizers only and can be replaced; the old one stops working. Organizers can remove members, anyone can leave, and a circle never ends up without an organizer. Joining a circle shares nothing by itself: lists shared by link are open to people in the owner's circles, and lists limited to particular circles stay limited to those until the owner adds another.
+- **Children.** A child's list is never shared by link when it is created. It is shared with exactly the circles the guardian ticks.
+- **Blocking.** A block belongs to one person (a guardian can block in a child's name). It removes follows and any helper or co-owner role between the two people in both directions, stops the blocked person opening lists, following, joining a circle the blocker organizes, or naming the blocker on their own lists. Blocks placed on someone are kept as a hash of their address when they close their account, so signing up again does not lift them. Reporting a person blocks them.
+- **Being named on a list.** Co-owners and helpers are told when they are added and can leave at any time.
+
+## Administrators
+
+An administrator can: read and resolve reports (including, on a single-administrator server, reports about themselves), release any reservation with a recorded reason (except on their own sealed lists), delete a secret idea, edit retailer adapters, and read the claim audit log and activity feed. An administrator cannot read anyone's reservations on a sealed list they own or co-own. If someone names an administrator as co-owner of a list, that list is excluded from the administrator's console until they leave it (they are told, and "Leave this list" is on the list's menu).
+
+## Limits
+
+To keep one person from slowing the server down for everyone: 60 lists per person, 500 wishes per list (by any route: adding, importing, moving), 60 price points per wish, 20 child profiles per guardian, 1 MB per request, and per-address request rates on every write and on the heavier reads. A connection that neither sends nor reads for a minute is closed.
+
+## Guests
+
+Someone reserving by link confirms an email address with a code. Their browser keeps a private token per reservation so they can mark it bought or release it later; those tokens are ignored and forgotten once anyone signs in on that browser. If the guest later signs up with the same address, their reservations become part of their account. A guest reservation that nobody manages simply runs out with its hold period.
+
+## Closing an account
+
+The account row is kept as an anonymous tombstone so other people's gift records still make sense. Removed: name, address, birthday, sessions, follows, circle memberships, secret ideas, budgets, messages addressed to the person, and the notes, payment instructions and thank-you notes on their lists. Their lists are closed and renamed "Closed wishlist"; item names are kept because other people's records refer to them. Reservations they made stay accurate but anonymous, including ones made as a guest with the same address, and old manage links stop working. Open pledges are cancelled. Any Secret Santa draw they were in is closed up around them (their giver is given their recipient, and told).
 
 ## Browser extension
 
@@ -69,9 +99,9 @@ One limit is inherent to link sharing: a list shared by link shows "taken" marks
 
 1. Load it as an unpacked extension (`chrome://extensions`, Developer mode, "Load unpacked").
 2. In Hushlist open **Account and settings** and choose **Create an extension token**.
-3. Click the extension's toolbar button, enter your Hushlist address and paste the token.
+3. Click the extension's toolbar button, enter your Hushlist address and paste the token. The address must be `https://…` unless it is this computer (`http://localhost:…`), and must not contain a user name or `@`; the popup shows the exact address the token will be sent to.
 
-The token is stored in the browser's extension storage and can be revoked from the same settings page.
+The token is stored in the browser's extension storage and can be revoked from the same settings page. It can do three things only: list your lists, read a product link, and add an item. It cannot read reservations, the inbox or exports, change or delete anything, or create another token — so a leaked token cannot be used to take over the account.
 
 ## Layout
 

@@ -15,8 +15,8 @@ const LABELS = {
   claimed_item_out_of_stock: ['Stock', 'box'],
   claim_confirmed: ['Arrived', 'check'],
   list_revealed: ['List opened', 'gift'],
-  sign_in_code: ['Sign-in', 'lock'],
-  guest_verification_code: ['Verification', 'lock']
+  added_to_list: ['Lists', 'list'],
+  secret_santa_changed: ['Secret Santa', 'wand']
 };
 
 export default {
@@ -33,7 +33,7 @@ export default {
         <div>
           <p class="eyebrow">Inbox</p>
           <h1>Messages for you</h1>
-          <p>Nothing here ever tells you who is giving you what. That is checked on every message before it is written.</p>
+          <p>Nothing here ever tells you who is giving you what. That is checked on every message before it is written. Sign-in and verification codes are never shown here: they go to your mailbox only.</p>
         </div>
         <button class="btn" type="button" data-action="inbox-digest">${icon('inbox', { size: 18 })} Send me today's digest</button>
       </header>
@@ -56,7 +56,7 @@ export default {
               <div class="stack small muted">
                 <span class="pill">${label}</span>
                 <span class="nowrap">${timeAgo(n.created_at)}</span>
-                ${n.sent_at ? '' : html`<span class="pill pill--honey" title="Held back during quiet hours">Scheduled</span>`}
+                ${!n.sent_at && n.scheduled_for > new Date().toISOString() ? html`<span class="pill pill--honey" title="Held back during your quiet hours (9 pm to 8 am)">Arrives ${new Date(n.scheduled_for).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</span>` : ''}
               </div>
             </article>`;
         })}`;

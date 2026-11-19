@@ -1,9 +1,9 @@
 /** Entry point: routes, the app frame, account settings. */
 
 import { html, raw, render, avatar, $ } from './dom.js';
-import { post, patch, del } from './api.js';
+import { post, patch, del, forgetGuestTokens } from './api.js';
 import {
-  store, me, on, loadSession, configureRouter, installDelegation, navigate, refresh, toast, openSheet, confirmSheet, copyText, reportError
+  store, me, on, loadSession, configureRouter, installDelegation, navigate, currentAddress, refresh, toast, openSheet, confirmSheet, copyText, reportError
 } from './app.js';
 import { icon } from './icons.js';
 import home, { openAddItem } from './views/home.js';
@@ -208,6 +208,7 @@ on('revoke-token', async (el) => {
 
 on('sign-out', async () => {
   await post('/api/auth/logout');
+  forgetGuestTokens();
   document.querySelector('dialog.sheet')?.close();
   await loadSession();
   await navigate('/welcome', { replace: true });
@@ -258,6 +259,7 @@ on('demo-become', async (el) => {
 
 on('demo-guest', async () => {
   await post('/api/auth/logout');
+  forgetGuestTokens();
   document.querySelector('dialog.sheet')?.close();
   await loadSession();
   await navigate('/l/justin-winter-2026', { replace: true });
@@ -277,7 +279,7 @@ async function boot() {
 
   const params = new URLSearchParams(location.search);
   const sharedUrl = params.get('sharedUrl');
-  await navigate(location.pathname + location.search, { replace: true });
+  await navigate(currentAddress(), { replace: true });
 
   // Arrived from the share sheet or the bookmarklet: open "Add a wish" prefilled.
   if (sharedUrl !== null && me()) {

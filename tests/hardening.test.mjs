@@ -275,8 +275,20 @@ test('closing an account leaves no trace of the person and no loose ends for oth
     const club = (await nina.post('/api/groups', { name: "Nina's club" })).json.group;
     const code = (await nina.get('/api/groups')).json.groups[0].invite_code;
     const friend = await app.signUp('friend@example.com', 'Friend', { invite_code: code });
+    // Things that put Nina's name, or her list's name, into other people's inboxes and records.
+    const bike = (await nina.get('/api/lists')).json.lists[0].items[0];
+    const held = (await friend.post('/api/claims', { item_id: bike.id })).json.claim;
+    await friend.post('/api/follows', { target_id: nina.user.id });
+    await nina.post('/api/follows', { target_id: friend.user.id });
+    const ninasHold = (await nina.post('/api/claims', { item_id: 'itm_j1' })).json.claim;
+    const friendInboxBefore = JSON.stringify((await friend.get('/api/notifications')).json);
+    assert.ok(friendInboxBefore.includes('Nina Real'), 'the setup really did put her name in someone else\'s inbox');
 
     assert.equal((await nina.del('/api/account', { confirm: true })).status, 200);
+    // The friend is told their hold is gone, without her name; her own unbought hold elsewhere is freed.
+    assert.equal(app.db.prepare('SELECT status FROM claims WHERE id = ?').get(held.id).status, 'released');
+    assert.equal(app.db.prepare('SELECT status FROM claims WHERE id = ?').get(ninasHold.id).status, 'released');
+    assert.match(JSON.stringify((await friend.get('/api/notifications')).json), /wishlist you were giving from was closed/);
     const dump = JSON.stringify({
       users: app.db.prepare('SELECT * FROM users').all(),
       lists: app.db.prepare('SELECT * FROM lists').all(),
@@ -398,4 +410,166 @@ test('limits hold on every way in: imports and moves cannot overfill a list', ()
   transitionClaimState(d2, { claimId: hold.id, newState: 'purchased', actorId: 'usr_elena' });
   deleteAccount(d2, 'usr_arthur');
   assert.equal(d2.prepare('SELECT guest_name FROM claims WHERE id = ?').get(second.id).guest_name, 'Former member');
+});
+
+// ------------------------------------------------------------------ web surface
+
+import http from 'node:http';
+import { extractMetadataFromHtml, toProxiedImageUrl, recheckItemPriceAndStock } from '../src/services/capture.mjs';
+import { verifyGuestClaim } from '../src/services/claims.mjs';
+
+/** A request with the path sent exactly as written (fetch would tidy it up first). */
+function rawGet(base, path, headers = {}) {
+  const url = new URL(base);
+  return new Promise((resolve, reject) => {
+    const req = http.request({ host: url.hostname, port: url.port, path, method: 'GET', headers }, (res) => {
+      res.resume();
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers }));
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+test('addresses that a browser would read as another site are never served as a page', async () => {
+  const app = await startApp();
+  try {
+    for (const path of ['//evil.example/phish', '///evil.example/', '/\\evil.example/phish', '/.//evil.example/', '//evil.example']) {
+      assert.equal((await rawGet(app.base, path)).status, 404, path);
+    }
+    assert.equal((await rawGet(app.base, '/lists/anything')).status, 200, 'ordinary app paths still get the shell');
+    // The share target survives a character cut in half by its length limit.
+    const split = await rawGet(app.base, `/share-target?url=${'a'.repeat(2047)}%F0%9F%98%80`);
+    assert.equal(split.status, 302);
+  } finally { await app.close(); }
+});
+
+test('malformed input is refused with a 400, never a 500, and never from another site', async () => {
+  const app = await startApp();
+  try {
+    const justin = await app.as('usr_justin');
+    const odd = { toString: 1, valueOf: 1 };
+    const deep = JSON.parse('['.repeat(40) + ']'.repeat(40));
+    const cases = [
+      [app.guest, 'post', '/api/auth/start', { email: odd }],
+      [app.guest, 'post', '/api/auth/verify', { challenge_id: odd, code: odd }],
+      [app.guest, 'post', '/api/claims', { item_id: odd, guest_email: odd, qty: odd }],
+      [app.guest, 'post', '/api/claims/verify', { claim_id: odd, code: odd }],
+      [justin, 'post', '/api/items', { list_id: 'lst_justin_holiday', title: odd, price: odd, qty_wanted: odd }],
+      [justin, 'post', '/api/items', { list_id: 'lst_justin_holiday', title: 'Deep', price: deep }],
+      [justin, 'post', '/api/items', { list_id: 'lst_justin_holiday', title: 'Half a character', image: 'https://img.example.com/a\ud800' }],
+      [justin, 'post', '/api/lists', { name: 'x', group_ids: [[['grp_smith']]] }],
+      [justin, 'post', '/api/secret-santa', { group_id: odd, exclusions: deep }],
+      [justin, 'patch', '/api/lists/lst_justin_holiday', { co_owner_ids: deep, helper_user_id: odd }]
+    ];
+    for (const [who, method, path, body] of cases) {
+      const res = await who[method](path, body);
+      assert.ok(res.status < 500, `${method} ${path} ${JSON.stringify(body).slice(0, 60)} -> ${res.status}`);
+    }
+    // Control characters cannot ride in on an address (it is printed to the operator's log).
+    assert.equal((await app.guest.post('/api/auth/start', { email: '\u001b]0;pwn\u0007\u001b[2Jx@y.zz' })).status, 400);
+    assert.equal((await app.guest.post('/api/claims', { item_id: 'itm_j1', guest_email: 'a\u001b[31m@y.zz' })).status, 400);
+
+    // An oversized body gets an answer, not a dropped connection.
+    const big = await justin.post('/api/items', { list_id: 'lst_justin_holiday', title: 'x', notes: 'n'.repeat(1_100_000) });
+    assert.equal(big.status, 413);
+
+    // A write from another site is refused whether or not a cookie came with it.
+    const crossSite = await app.guest.post('/api/auth/logout', {}, { Origin: 'http://evil.example' });
+    assert.equal(crossSite.status, 403);
+    assert.equal(crossSite.headers.get('set-cookie'), null);
+    assert.equal((await app.guest.post('/api/auth/logout', {}, { Origin: 'null' })).status, 403);
+    assert.equal((await justin.post('/api/auth/logout', {}, { Origin: app.base })).status, 200);
+  } finally { await app.close(); }
+});
+
+test('nobody can make the server slow or large for everyone else', async () => {
+  const db = testDb();
+
+  // The attribute scanner is linear: four times the input takes about four times as long, not sixteen.
+  const hostile = (kb) => ('<a ' + 'a'.repeat(1990) + '>').repeat(Math.ceil(kb * 1024 / 1994));
+  const time = (html) => { const t = process.hrtime.bigint(); extractMetadataFromHtml(db, 'https://shop.example.com/p/1', html); return Number(process.hrtime.bigint() - t) / 1e6; };
+  time(hostile(64));
+  const small = Math.min(time(hostile(128)), time(hostile(128)));
+  const large = Math.min(time(hostile(512)), time(hostile(512)));
+  assert.ok(large < Math.max(small * 8, 60), `512 KB took ${large.toFixed(0)} ms against ${small.toFixed(0)} ms for 128 KB`);
+
+  // Price history records changes and keeps a fixed number of them.
+  for (let i = 0; i < 150; i++) recheckItemPriceAndStock(db, { itemId: 'itm_j1', newPrice: 100 + (i % 7) });
+  const points = db.prepare("SELECT COUNT(*) AS n FROM price_snapshots WHERE item_id = 'itm_j1'").get().n;
+  assert.ok(points <= 60, `${points} points kept`);
+  recheckItemPriceAndStock(db, { itemId: 'itm_j1', newPrice: 555 });
+  recheckItemPriceAndStock(db, { itemId: 'itm_j1', newPrice: 555 });
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM price_snapshots WHERE item_id = 'itm_j1' AND price = 555").get().n, 1, 'the same price twice is one point');
+
+  // A shop whose name is also a built-in property name imports like any other.
+  const report = importAmazonList(db, {
+    listId: 'lst_justin_holiday', canEdit: () => true,
+    itemsPayload: [{ title: 'Sneaker', url: 'https://www.constructor.io/p/sneaker' }, { title: 'Proto', url: 'https://__proto__.example.com/p/1' }]
+  });
+  assert.equal(report.imported.length, 2);
+  assert.equal(db.prepare("SELECT store FROM items WHERE title = 'Sneaker'").get().store, 'Constructor');
+
+  // Only a checked address is ever stored as an image reference.
+  assert.equal(toProxiedImageUrl('/api/image-proxy/../../x"onerror=alert(1)'), null);
+  assert.equal(toProxiedImageUrl('/api/image-proxy?url=javascript%3Aalert(1)'), null);
+  assert.match(toProxiedImageUrl('https://img.example.com/a.png'), /^\/api\/image-proxy\?url=https%3A/);
+
+  const app = await startApp();
+  try {
+    const justin = await app.as('usr_justin');
+    // Lists per person are capped (creation is rate limited too, so fill directly).
+    const insert = app.db.prepare("INSERT INTO lists (id, owner_id, name, share_token, created_at) VALUES (?, 'usr_justin', 'Filler', ?, ?)");
+    for (let i = 0; i < 59; i++) insert.run(`lst_fill_${i}`, `tok_fill_${i}`, new Date().toISOString());
+    assert.equal((await justin.post('/api/lists', { name: 'One too many' })).status, 409);
+    // …and the dashboard of someone in their circle still answers promptly.
+    const elena = await app.as('usr_elena');
+    const dash = await elena.get('/api/dashboard');
+    assert.equal(dash.status, 200);
+    assert.ok(dash.json.people_i_shop_for.find(p => p.person.id === 'usr_justin').lists.length >= 1);
+  } finally { await app.close(); }
+
+  // Behind a proxy, the address used for limits is the one the proxy added, not one the caller typed.
+  const proxied = await startApp({ demoMode: false, trustProxy: true });
+  try {
+    const statuses = [];
+    for (let i = 0; i < 7; i++) {
+      statuses.push((await proxied.guest.post('/api/reports', { target_type: 'list', target_id: 'x', reason: 'r' }, { 'X-Forwarded-For': `10.9.${i}.1, 203.0.113.77` })).status);
+    }
+    assert.deepEqual(statuses.slice(5), [429, 429]);
+  } finally { await proxied.close(); }
+});
+
+test('guest reservations: one browser can manage several, a signed-in person cannot use leftovers, and they follow you into an account', async () => {
+  const app = await startApp();
+  try {
+    const reserve = async (itemId, email) => {
+      const made = await app.guest.post('/api/claims', { item_id: itemId, guest_email: email });
+      return (await app.guest.post('/api/claims/verify', { claim_id: made.json.claim.id, code: made.json.claim.demo_verification_code })).json.claim;
+    };
+    const first = await reserve('itm_j1', 'sam@example.com');
+    const second = await reserve('itm_j3', 'sam@example.com');
+    const browser = app.guest.withHeaders({ 'X-Guest-Token': `${first.manage_token},${second.manage_token}` });
+    const mine = (await browser.get('/api/lists/justin-winter-2026')).json.list.items.flatMap(i => i.claim_summary.claims).filter(c => c.is_own_claim);
+    assert.equal(mine.length, 2, 'both reservations are recognised');
+    assert.equal((await browser.patch(`/api/claims/${first.id}`, { status: 'purchased' })).status, 200);
+
+    // Someone else signs in on the same browser: the leftover tokens do nothing for them.
+    const other = await app.signUp('other@example.com', 'Other Person');
+    const reused = other.withHeaders({ 'X-Guest-Token': `${first.manage_token},${second.manage_token}` });
+    assert.equal((await reused.patch(`/api/claims/${second.id}`, { status: 'released' })).status, 403);
+    const seen = (await reused.get('/api/lists/justin-winter-2026')).json.list.items.flatMap(i => i.claim_summary.claims);
+    assert.equal(seen.filter(c => c.is_own_claim).length, 0);
+
+    // The guest signs up with the address they confirmed: the reservations are theirs, by account.
+    const sam = await app.signUp('sam@example.com', 'Sam');
+    const tracker = (await sam.get('/api/dashboard')).json.my_claims_tracker;
+    assert.deepEqual(tracker.map(c => c.id).sort(), [first.id, second.id].sort());
+    assert.equal((await browser.patch(`/api/claims/${second.id}`, { status: 'released' })).status, 403, 'and the old tokens no longer open them');
+
+    // An owner cannot reserve on their own list by posing as a guest with their own address.
+    const sneaky = await app.guest.post('/api/claims', { item_id: 'itm_j4', guest_email: 'justin@smith.example' });
+    const refused = await app.guest.post('/api/claims/verify', { claim_id: sneaky.json.claim.id, code: sneaky.json.claim.demo_verification_code });
+    assert.equal(refused.status, 403);
+  } finally { await app.close(); }
 });

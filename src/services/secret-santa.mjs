@@ -4,9 +4,9 @@
  * - Only a group organizer can run a draw, for a date that has not passed.
  * - Participants are the group's active adult members.
  * - Exclusions are unordered pairs who must not draw each other. They are
- *   shown to every participant, and a set of exclusions that would leave only
- *   a couple of possible outcomes is refused — otherwise the person choosing
- *   them could work out (or dictate) who has whom.
+ *   shown to every participant, and a set of exclusions is refused if it
+ *   would let anyone work out the whole draw from their own pairing —
+ *   otherwise the person choosing them could arrange to know who has whom.
  * - The draw is uniform: every outcome the rules allow is equally likely.
  *   There is no "avoid A↔B swaps" preference, because any such rule lets a
  *   participant rule out their own recipient as their giver.
@@ -79,13 +79,17 @@ export function createSecretSantaExchange(db, {
 
   const options = new Map(members.map(g => [g, members.filter(r => r !== g && !forbiddenPairs.has(`${g}>${r}`))]));
 
-  // With exclusions in play, the rules must leave real uncertainty: at least
-  // three different complete draws. Fewer, and whoever chose the exclusions
-  // could know or dictate the pairings.
-  if (cleanExclusions.length > 0 && !hasAtLeastThreeDraws(members, options)) {
-    throw conflict(findAnyAssignment(members, options)
-      ? 'Those exclusions leave almost no choice about who gives to whom, so the draw would not be secret. Remove some and try again.'
-      : 'Those exclusions leave no valid draw. Remove one and try again.');
+  // With exclusions in play, the rules must leave real uncertainty. Knowing
+  // your own recipient (which everyone does) must never be enough to work out
+  // everybody else's — otherwise whoever chose the exclusions could arrange to
+  // know the whole draw.
+  if (cleanExclusions.length > 0) {
+    if (!findAnyAssignment(members, options)) {
+      throw conflict('Those exclusions leave no valid draw. Remove one and try again.');
+    }
+    if (!leavesDoubt(members, options)) {
+      throw conflict('Those exclusions leave almost no choice about who gives to whom, so the draw would not be secret. Remove some and try again.');
+    }
   }
 
   const assignment = drawUniform(members, options);
@@ -172,30 +176,38 @@ function findAnyAssignment(members, options, { fixed = new Map(), banned = new S
   return recipientOf;
 }
 
-/** True when at least three different complete draws satisfy the rules. */
-function hasAtLeastThreeDraws(members, options) {
-  const first = findAnyAssignment(members, options);
-  if (!first) return false;
-  // A second draw must differ from the first in at least one pairing.
-  let second = null;
-  for (const [g, r] of first) {
-    second = findAnyAssignment(members, options, { banned: new Set([`${g}>${r}`]) });
-    if (second) break;
-  }
-  if (!second) return false;
-  // A third must differ from both: ban one pairing of each.
-  for (const [g1, r1] of first) {
-    if (second.get(g1) === r1) {
-      // Shared pairing: banning it alone excludes both draws at once.
-      if (findAnyAssignment(members, options, { banned: new Set([`${g1}>${r1}`]) })) return true;
-      continue;
+/**
+ * True when, for every pairing that could come up, at least two different
+ * complete draws contain it. Then no participant can deduce the whole draw
+ * from the one pairing they know.
+ *
+ * When everyone still has more than half the group to draw from, that always
+ * holds and nothing needs checking. Otherwise each possible pairing is tested,
+ * within a time allowance; exclusion sets too tangled to check in that time
+ * are refused rather than waved through.
+ */
+function leavesDoubt(members, options) {
+  const n = members.length;
+  const fewest = Math.min(...members.map(g => options.get(g).length));
+  if (fewest >= n / 2 + 2) return true;
+  if (n > 60) return false;
+
+  const deadline = Date.now() + 1500;
+  for (const giver of members) {
+    for (const recipient of options.get(giver)) {
+      if (Date.now() > deadline) return false;
+      const fixed = new Map([[giver, recipient]]);
+      const first = findAnyAssignment(members, options, { fixed });
+      if (!first) continue; // this pairing can never come up
+      let another = false;
+      for (const [g, r] of first) {
+        if (g === giver) continue;
+        if (findAnyAssignment(members, options, { fixed, banned: new Set([`${g}>${r}`]) })) { another = true; break; }
+      }
+      if (!another) return false;
     }
-    for (const [g2, r2] of second) {
-      if (first.get(g2) === r2) continue;
-      if (findAnyAssignment(members, options, { banned: new Set([`${g1}>${r1}`, `${g2}>${r2}`]) })) return true;
-    }
   }
-  return false;
+  return true;
 }
 
 /**
@@ -254,9 +266,44 @@ export function removeFromExchanges(db, userId) {
     const remaining = db.prepare('SELECT COUNT(*) AS n FROM secret_santa_pairings WHERE exchange_id = ?').get(row.exchange_id).n - 1;
     const live = row.event_date >= today;
 
-    if (remaining < 3 || !theirGiver || theirGiver === row.recipient_user_id) {
-      // Too few people left for a secret draw (or the only way to close the
-      // gap would have someone giving to themselves).
+    const excluded = new Set();
+    try {
+      for (const [a, b] of JSON.parse(db.prepare('SELECT exclusions FROM secret_santa_exchanges WHERE id = ?').get(row.exchange_id)?.exclusions || '[]')) {
+        excluded.add(`${a}>${b}`); excluded.add(`${b}>${a}`);
+      }
+    } catch { /* malformed: no exclusions */ }
+    const allowed = (giver, recipient) => giver !== recipient && !excluded.has(`${giver}>${recipient}`);
+    const setRecipient = db.prepare('UPDATE secret_santa_pairings SET recipient_user_id = ? WHERE exchange_id = ? AND giver_user_id = ?');
+    const told = [];
+    let repaired = false;
+
+    if (remaining >= 3 && theirGiver) {
+      db.prepare('DELETE FROM secret_santa_pairings WHERE exchange_id = ? AND giver_user_id = ?').run(row.exchange_id, userId);
+      if (allowed(theirGiver, row.recipient_user_id)) {
+        // The usual case: whoever was giving to them takes over their person.
+        setRecipient.run(row.recipient_user_id, row.exchange_id, theirGiver);
+        told.push(theirGiver);
+        repaired = true;
+      } else {
+        // The two had drawn each other (or the takeover would break a rule),
+        // which leaves one person with nobody to give to and nobody giving to
+        // them. They are slotted into another pairing: A→B becomes A→them→B.
+        const loose = theirGiver;
+        const others = shuffled(db.prepare(
+          'SELECT giver_user_id AS g, recipient_user_id AS r FROM secret_santa_pairings WHERE exchange_id = ? AND giver_user_id != ?'
+        ).all(row.exchange_id, loose));
+        const host = others.find(p => p.r !== userId && allowed(p.g, loose) && allowed(loose, p.r));
+        if (host && theirGiver === row.recipient_user_id) {
+          setRecipient.run(loose, row.exchange_id, host.g);
+          setRecipient.run(host.r, row.exchange_id, loose);
+          told.push(host.g, loose);
+          repaired = true;
+        }
+      }
+    }
+
+    if (!repaired) {
+      // Too few people left, or no way to close the gap within the rules.
       const others = db.prepare('SELECT giver_user_id FROM secret_santa_pairings WHERE exchange_id = ? AND giver_user_id != ?')
         .all(row.exchange_id, userId).map(r => r.giver_user_id);
       db.prepare('DELETE FROM secret_santa_pairings WHERE exchange_id = ?').run(row.exchange_id);
@@ -267,23 +314,22 @@ export function removeFromExchanges(db, userId) {
             recipientUserId: id,
             eventType: 'secret_santa_changed',
             subject: `"${row.name}" was cancelled`,
-            body: `Someone left the circle, which leaves too few people for "${row.name}". An organizer can draw names again.`
+            body: `Someone left the circle, and "${row.name}" could not be kept going without them. An organizer can draw names again.`
           });
         }
       }
       continue;
     }
 
-    db.prepare('DELETE FROM secret_santa_pairings WHERE exchange_id = ? AND giver_user_id = ?').run(row.exchange_id, userId);
-    db.prepare('UPDATE secret_santa_pairings SET recipient_user_id = ? WHERE exchange_id = ? AND giver_user_id = ?')
-      .run(row.recipient_user_id, row.exchange_id, theirGiver);
     if (live) {
-      sendNotification(db, {
-        recipientUserId: theirGiver,
-        eventType: 'secret_santa_changed',
-        subject: `Your person in "${row.name}" has changed`,
-        body: `Someone left the circle, so you now have a different person to give to in "${row.name}". Open Circles to see who.`
-      });
+      for (const id of told) {
+        sendNotification(db, {
+          recipientUserId: id,
+          eventType: 'secret_santa_changed',
+          subject: `Your person in "${row.name}" has changed`,
+          body: `Someone left the circle, so you now have a different person to give to in "${row.name}". Open Circles to see who.`
+        });
+      }
     }
   }
 }

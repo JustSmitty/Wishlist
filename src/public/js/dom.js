@@ -43,7 +43,10 @@ export function render(target, content) {
 /** http(s) and same-site paths only; anything else becomes an inert "#". */
 export function safeUrl(value) {
   if (typeof value !== 'string') return '#';
-  if (value.startsWith('/') && !value.startsWith('//')) return value;
+  // A same-site path: one leading slash, then nothing a browser could read as
+  // the start of a host ("//x", "/\\x", or the same hidden behind a tab or newline).
+  if (/^\/(?![/\\])[^\x00-\x1f\\]*$/.test(value)) return value;
+  if (value.startsWith('/')) return '#';
   try {
     const u = new URL(value);
     return u.protocol === 'http:' || u.protocol === 'https:' ? u.href : '#';

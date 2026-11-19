@@ -26,6 +26,21 @@ test('safeUrl allows http(s) and same-site paths only', () => {
   for (const bad of ['javascript:alert(1)', ' javascript:alert(1)', 'JaVaScRiPt:alert(1)', 'data:text/html,x', 'vbscript:x', '//evil.example/x', 'not a url', null, 42]) {
     assert.equal(safeUrl(bad), '#', String(bad));
   }
+  // Paths a browser would read as another site's address are not "same-site paths".
+  for (const bad of ['/\\evil.example/x', '/\t/evil.example/x', '/\n/evil.example/x', '/a\\b', '///evil.example']) {
+    assert.equal(safeUrl(bad), '#', JSON.stringify(bad));
+  }
+  assert.equal(safeUrl('/lists/abc?x=1#top'), '/lists/abc?x=1#top');
+});
+
+test('the offline shell lists every script and stylesheet the app loads', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const root = new URL('../src/public/', import.meta.url).pathname;
+  const sw = fs.readFileSync(path.join(root, 'sw.js'), 'utf8');
+  const files = [...fs.readdirSync(path.join(root, 'js')).filter(f => f.endsWith('.js')).map(f => `/js/${f}`),
+    ...fs.readdirSync(path.join(root, 'js/views')).map(f => `/js/views/${f}`), '/styles.css'];
+  for (const file of files) assert.ok(sw.includes(`'${file}'`), `${file} is missing from the service worker's shell list`);
 });
 
 test('formatting helpers', () => {
@@ -68,4 +83,49 @@ test('gift artwork is deterministic and contains no script-capable markup', () =
   assert.equal(a, b);
   assert.ok(!/script|onerror|href|NaN|undefined/i.test(a));
   assert.notEqual(String(giftArt(item, 'open')).length, a.length);
+});
+
+test('every front-end module imports what it calls', async () => {
+  // There is no build step to catch a call to a function that was never
+  // imported; the page would simply fail to start. This checks each module's
+  // calls to functions exported by the others against its own imports.
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const root = new URL('../src/public/js/', import.meta.url).pathname;
+  const files = [...fs.readdirSync(root).filter(f => f.endsWith('.js')).map(f => path.join(root, f)),
+    ...fs.readdirSync(path.join(root, 'views')).map(f => path.join(root, 'views', f))];
+  const source = new Map(files.map(f => [f, fs.readFileSync(f, 'utf8')]));
+
+  const exported = new Set();
+  for (const text of source.values()) {
+    for (const m of text.matchAll(/^export (?:async )?(?:function|const|let|class) ([A-Za-z_$][\w$]*)/gm)) exported.add(m[1]);
+    for (const m of text.matchAll(/^export \{([^}]*)\}/gm)) m[1].split(',').forEach(n => exported.add(n.trim().split(/\s+as\s+/).pop()));
+  }
+  exported.delete('default');
+
+  const missing = [];
+  for (const [file, text] of source) {
+    const known = new Set();
+    for (const m of text.matchAll(/import\s+(?:([A-Za-z_$][\w$]*)\s*,?\s*)?(?:\{([^}]*)\})?\s*from/g)) {
+      if (m[1]) known.add(m[1]);
+      if (m[2]) m[2].split(',').forEach(n => known.add(n.trim().split(/\s+as\s+/).pop()));
+    }
+    for (const m of text.matchAll(/(?:function|const|let|var|class)\s+([A-Za-z_$][\w$]*)/g)) known.add(m[1]);
+    for (const m of text.matchAll(/(?:const|let)\s+\{([^}]*)\}\s*=/g)) m[1].split(',').forEach(n => known.add(n.trim().split(':').pop().trim()));
+    for (const m of text.matchAll(/(?:const|let)\s+\[([^\]]*)\]\s*=/g)) m[1].split(',').forEach(n => known.add(n.trim()));
+    const code = text.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+    for (const name of exported) {
+      if (known.has(name)) continue;
+      const call = new RegExp(`(?<![.\\w$'"\`-])${name.replace('$', '\\$')}\\(`, 'g');
+      for (const m of code.matchAll(call)) {
+        const lineStart = code.lastIndexOf('\n', m.index) + 1;
+        const line = code.slice(lineStart, code.indexOf('\n', m.index));
+        // "name(args) {" at the start of a line is a method being defined, not a call.
+        if (new RegExp(`^\\s*(?:async\\s+)?${name.replace('$', '\\$')}\\s*\\([^)]*\\)\\s*\\{`).test(line)) continue;
+        missing.push(`${path.relative(root, file)}: ${name}()`);
+        break;
+      }
+    }
+  }
+  assert.deepEqual(missing, []);
 });

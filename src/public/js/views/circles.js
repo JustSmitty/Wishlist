@@ -1,8 +1,8 @@
 /** Circles: the groups you share lists with, and Secret Santa. */
 
 import { html, raw, money, plural, avatar, dateLong, daysUntil, countdown } from '../dom.js';
-import { get, post } from '../api.js';
-import { store, on, refresh, toast, openSheet, copyText } from '../app.js';
+import { get, post, del } from '../api.js';
+import { store, me, on, refresh, toast, openSheet, confirmSheet, copyText } from '../app.js';
 import { icon, empty } from '../parts.js';
 import { confetti } from '../confetti.js';
 
@@ -40,6 +40,7 @@ function circleCard(g) {
   const live = g.exchanges.find(ex => ex.event_date >= today);
   const past = g.exchanges.filter(ex => ex !== live);
   const adults = g.members.length;
+  const organizer = g.my_role === 'organizer';
   return html`
     <section class="card stack" aria-labelledby="circle-${g.id}">
       <div class="row row--between">
@@ -47,18 +48,25 @@ function circleCard(g) {
           <h2 id="circle-${g.id}">${g.name}</h2>
           ${g.description ? html`<p class="muted">${g.description}</p>` : ''}
         </div>
-        <span class="pill">${g.my_role === 'organizer' ? 'You organise this' : 'Member'}</span>
+        <span class="row">
+          <span class="pill">${organizer ? 'You organise this' : 'Member'}</span>
+          <button class="btn btn--quiet btn--sm" type="button" data-action="leave-circle" data-group="${g.id}" data-name="${g.name}">Leave</button>
+        </span>
       </div>
 
       <div class="members">
-        ${g.members.map(m => html`<span class="member">${avatar(m.name, { size: 'sm' })}${m.name}${m.role === 'organizer' ? html` <span class="muted small">· organiser</span>` : ''}</span>`)}
+        ${g.members.map(m => html`<span class="member">${avatar(m.name, { size: 'sm' })}${m.name}${m.role === 'organizer' ? html` <span class="muted small">· organiser</span>` : ''}${organizer && m.id !== me().id ? html`
+          <button class="btn btn--quiet btn--sm" type="button" data-action="remove-member" data-group="${g.id}" data-user="${m.id}" data-name="${m.name}" aria-label="Remove ${m.name} from ${g.name}">Remove</button>` : ''}</span>`)}
       </div>
 
-      <div class="invite">
-        <div class="grow"><span class="eyebrow">Invite code</span><br /><code>${g.invite_code}</code></div>
-        <button class="btn btn--sm" type="button" data-action="copy-invite" data-code="${g.invite_code}">${icon('copy', { size: 16 })} Copy</button>
-        <p class="small muted">Anyone with this code can join and see the lists shared here. Send it only to people you mean to invite.</p>
-      </div>
+      ${organizer ? html`
+        <div class="invite">
+          <div class="grow"><span class="eyebrow">Invite code</span><br /><code>${g.invite_code}</code></div>
+          <button class="btn btn--sm" type="button" data-action="copy-invite" data-code="${g.invite_code}">${icon('copy', { size: 16 })} Copy</button>
+          <button class="btn btn--sm btn--quiet" type="button" data-action="renew-invite" data-group="${g.id}">New code</button>
+          <p class="small muted">Anyone with this code can join and see the lists shared here. Send it only to people you mean to invite. "New code" makes the old one stop working.</p>
+        </div>` : html`
+        <p class="small muted">To bring someone in, ask an organiser for the invite code.</p>`}
 
       <hr />
 
@@ -82,11 +90,13 @@ function circleCard(g) {
             </button>
             <p class="small muted">Only you can see who you drew. Not even the organiser can see the other pairings.</p>` : html`
             <p class="muted small">You joined after names were drawn, so you are not in this one.</p>`}
+          ${live.exclusions?.length ? html`
+            <p class="small muted">Rules everyone in this draw can see — these pairs cannot draw each other: ${live.exclusions.map(pair => pair.join(' and ')).join('; ')}.</p>` : ''}
         </div>` : html`
         <p class="muted small">${adults < 3
           ? 'A draw needs at least three people in the circle.'
           : g.my_role === 'organizer'
-            ? 'Everyone is given one person to buy for. You can keep partners from drawing each other.'
+            ? 'Everyone is given one person to buy for. You can keep partners from drawing each other; everyone in the draw sees those rules.'
             : 'No names drawn yet. An organiser can start a draw.'}</p>`}
 
       ${past.length ? html`<p class="small muted">Earlier: ${past.map(ex => `${ex.name} (${dateLong(ex.event_date)})`).join(', ')}</p>` : ''}
@@ -94,6 +104,42 @@ function circleCard(g) {
 }
 
 on('copy-invite', (el) => copyText(el.dataset.code, 'Invite code copied'));
+
+on('renew-invite', async (el) => {
+  const ok = await confirmSheet({
+    title: 'Make a new invite code?',
+    message: 'The current code stops working at once. People already in the circle are not affected.',
+    confirmLabel: 'Make a new code'
+  });
+  if (!ok) return;
+  await post(`/api/groups/${encodeURIComponent(el.dataset.group)}/invite`);
+  toast('New invite code ready');
+  await refresh();
+});
+
+on('remove-member', async (el) => {
+  const ok = await confirmSheet({
+    title: `Remove ${el.dataset.name}?`,
+    message: 'They stop seeing the lists shared with this circle. If they still have the invite code they could rejoin, so make a new code as well if that matters.',
+    confirmLabel: 'Remove', danger: true
+  });
+  if (!ok) return;
+  await del(`/api/groups/${encodeURIComponent(el.dataset.group)}/members/${encodeURIComponent(el.dataset.user)}`);
+  toast(`${el.dataset.name} was removed`);
+  await refresh();
+});
+
+on('leave-circle', async (el) => {
+  const ok = await confirmSheet({
+    title: `Leave ${el.dataset.name}?`,
+    message: 'You stop seeing lists shared with this circle, and your own lists stop being shared with it. You can rejoin later with an invite code.',
+    confirmLabel: 'Leave', danger: true
+  });
+  if (!ok) return;
+  await del(`/api/groups/${encodeURIComponent(el.dataset.group)}/members/${encodeURIComponent(me().id)}`);
+  toast(`You left ${el.dataset.name}`);
+  await refresh();
+});
 
 on('open-envelope', (el) => {
   const open = el.getAttribute('aria-expanded') === 'true';
@@ -117,7 +163,7 @@ on('new-circle', () => {
 
 on('join-circle', () => {
   openSheet({
-    title: 'Join a circle', intro: 'Enter the invite code someone sent you. Your link-shared lists are shared with the circle too.', size: 'narrow', submitLabel: 'Join',
+    title: 'Join a circle', intro: 'Enter the invite code someone sent you. Joining shares nothing by itself: lists you share by link are open to people in your circles, and lists limited to particular circles stay limited to those until you add this one.', size: 'narrow', submitLabel: 'Join',
     body: html`<div class="field"><label for="jc-code">Invite code</label><input id="jc-code" name="invite_code" required maxlength="64" autocapitalize="characters" autocomplete="off" /></div>`,
     onSubmit: async (v) => {
       const { group } = await post('/api/groups/join', v);
@@ -134,7 +180,7 @@ on('draw-names', (el) => {
 
   const sheet = openSheet({
     title: 'Draw names',
-    intro: `Each of the ${group.members.length} people in ${group.name} is given one person to buy for. Once drawn it cannot be redrawn until the exchange date has passed.`,
+    intro: `Each of the ${group.members.length} people in ${group.name} is given one person to buy for, with every allowed outcome equally likely. Once drawn it cannot be redrawn until the exchange date has passed.`,
     submitLabel: 'Draw',
     body: html`
       <div class="field"><label for="dn-name">Name of the exchange</label><input id="dn-name" name="name" required maxlength="120" value="Secret Santa" /></div>
@@ -143,7 +189,7 @@ on('draw-names', (el) => {
         <div class="field"><label for="dn-budget">Spending limit</label><input id="dn-budget" name="budget_limit" type="number" min="0" step="1" inputmode="decimal" value="50" /></div>
       </div>
       <fieldset class="field">
-        <legend class="label">Keep these two from drawing each other <span class="muted">(optional)</span></legend>
+        <legend class="label">Keep these two from drawing each other <span class="muted">(optional — everyone in the draw will see these)</span></legend>
         <div class="row">
           <select name="ex_a" aria-label="First person">${group.members.map(m => html`<option value="${m.id}">${m.name}</option>`)}</select>
           <select name="ex_b" aria-label="Second person">${group.members.map((m, i) => html`<option value="${m.id}" ${i === 1 ? raw('selected') : ''}>${m.name}</option>`)}</select>

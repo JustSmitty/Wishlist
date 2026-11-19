@@ -4,7 +4,7 @@
  */
 
 import { html, raw, render, esc, $ } from './dom.js';
-import { get, ApiError } from './api.js';
+import { get, patch, ApiError, forgetGuestTokens } from './api.js';
 import { icon } from './icons.js';
 
 export const store = {
@@ -16,7 +16,24 @@ export const me = () => store.session.current_user;
 
 export async function loadSession() {
   store.session = await get('/api/session');
+  // Once someone is signed in, guest tokens kept by this browser are dropped.
+  if (store.session.current_user) forgetGuestTokens();
+  reportTimeZone();
   return store.session;
+}
+
+/**
+ * Tells the server which time zone this person is in, so messages that can
+ * wait are held during their night rather than the server's. Best effort.
+ */
+function reportTimeZone() {
+  const user = store.session.current_user;
+  if (!user) return;
+  let zone = null;
+  try { zone = Intl.DateTimeFormat().resolvedOptions().timeZone || null; } catch { /* unavailable */ }
+  if (!zone || zone === user.time_zone) return;
+  user.time_zone = zone;
+  patch('/api/account', { time_zone: zone }).catch(() => {});
 }
 
 // ---------------------------------------------------------------- toasts
@@ -122,7 +139,7 @@ export function installDelegation() {
     if (open) { open.removeAttribute('open'); open.querySelector('summary')?.focus(); }
   });
 
-  window.addEventListener('popstate', () => routeTo(location.pathname + location.search, { push: false }));
+  window.addEventListener('popstate', () => routeTo(currentAddress(), { push: false }));
 }
 
 // ---------------------------------------------------------------- routing
@@ -147,9 +164,20 @@ function match(pathname) {
   return null;
 }
 
+/**
+ * The address bar as an in-app path. A path that begins with two slashes (or a
+ * backslash) would be read as another site's address if it were resolved as a
+ * link, so leading slashes are collapsed to one first.
+ */
+export function currentAddress() {
+  return '/' + location.pathname.replace(/^[/\\]+/, '') + location.search;
+}
+
 async function routeTo(url, { push = true, replace = false } = {}) {
-  const target = new URL(url, location.origin);
-  if (target.origin !== location.origin) { location.href = target.href; return; }
+  // The router only ever shows pages of this app. Anything that resolves to
+  // another site is treated as an unknown page, never followed.
+  let target = new URL(String(url).replace(/^[/\\]+/, '/'), location.origin);
+  if (target.origin !== location.origin) target = new URL('/', location.origin);
 
   // Older share links used /?list=<token>.
   const legacy = target.pathname === '/' ? target.searchParams.get('list') : null;

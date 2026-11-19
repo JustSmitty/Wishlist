@@ -38,8 +38,10 @@ export function readJsonBody(req) {
       if (done) return;
       size += chunk.length;
       if (size > MAX_BODY_BYTES) {
-        fail(new AppError('Request body is too large', 413));
-        req.destroy();
+        // Stop reading, but leave the socket open long enough to say why.
+        // The error handler answers 413 and then closes the connection.
+        req.pause();
+        fail(new AppError('Request body is too large', 413, { closeConnection: true }));
         return;
       }
       chunks.push(chunk);
@@ -62,9 +64,32 @@ export function readJsonBody(req) {
       if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
         return reject(badRequest('The request body must be a JSON object'));
       }
+      if (!tameJson(parsed, 0)) return reject(badRequest('The request body is nested too deeply'));
       resolve(parsed);
     });
   });
+}
+
+const MAX_JSON_DEPTH = 12;
+const UNSAFE_KEYS = ['__proto__', 'constructor', 'prototype', 'toString', 'valueOf', 'toJSON'];
+
+/**
+ * Makes a parsed body safe to hand to ordinary code. Returns false when it is
+ * nested more deeply than any real request, and removes the handful of keys
+ * that change how a plain object behaves when it is converted to a string or
+ * number (a body such as {"email":{"toString":1}} would otherwise throw
+ * wherever String() is applied to it).
+ */
+function tameJson(value, depth) {
+  if (value === null || typeof value !== 'object') return true;
+  if (depth >= MAX_JSON_DEPTH) return false;
+  if (Array.isArray(value)) {
+    for (const entry of value) if (!tameJson(entry, depth + 1)) return false;
+    return true;
+  }
+  for (const key of UNSAFE_KEYS) if (Object.hasOwn(value, key)) delete value[key];
+  for (const key of Object.keys(value)) if (!tameJson(value[key], depth + 1)) return false;
+  return true;
 }
 
 export function parseCookies(header) {
@@ -101,6 +126,8 @@ export class RateLimiter {
 
   /** Returns true when the call is allowed. */
   allow(key, maxRequests, windowMs = 60_000) {
+    // Keys contain caller-supplied text (an address, an email); keep them short.
+    if (key.length > 200) key = key.slice(0, 200);
     const now = Date.now();
     if (now - this.lastSweep > 60_000 || this.buckets.size > 50_000) this.sweep(now);
     const entry = this.buckets.get(key);
@@ -161,9 +188,17 @@ export async function serveStatic(req, res, publicDir, pathname) {
   const filePath = path.resolve(publicDir, relative);
   if (filePath !== publicDir && !filePath.startsWith(publicDir + path.sep)) return false;
 
+  // Only ordinary, visible files that really live in the public folder are
+  // served: no dotfiles, and nothing reached through a symbolic link (which
+  // could point anywhere on the machine).
+  if (relative.split('/').some(part => part.startsWith('.'))) return false;
   let data;
   try {
-    data = await fs.readFile(filePath);
+    const real = await fs.realpath(filePath);
+    const root = await fs.realpath(publicDir);
+    if (real !== path.join(root, path.relative(publicDir, filePath))) return false;
+    if (!(await fs.lstat(real)).isFile()) return false;
+    data = await fs.readFile(real);
   } catch {
     return false;
   }

@@ -19,6 +19,10 @@ export default {
     const sorted = [...people].sort((a, b) => (a.next_occasion?.days_remaining ?? 9999) - (b.next_occasion?.days_remaining ?? 9999));
     const requests = follows.followers_of_me.filter(f => f.status === 'pending');
     const others = follows.followers_of_me.filter(f => f.status !== 'pending');
+    const blocked = follows.blocked || [];
+    const forWhom = (f) => (f.for_user_id && f.for_user_id !== store.session.current_user.id)
+      ? (store.session.dependents.find(d => d.id === f.for_user_id)?.name || 'your child')
+      : null;
 
     return html`
       <header class="page-head">
@@ -32,15 +36,15 @@ export default {
 
       ${requests.length ? html`
         <div class="card stack">
-          <h2>${plural(requests.length, 'person', 'people')} would like to follow you</h2>
-          <p class="muted small">Followers see the lists you share by link on their Gifting page. They do not see secret ideas or payment details.</p>
+          <h2>${plural(requests.length, 'follow request')}</h2>
+          <p class="muted small">Followers see the lists shared by link on their Gifting page. They do not see secret ideas or payment details.</p>
           ${requests.map(f => html`
             <div class="row row--between">
-              <span class="row">${avatar(f.follower_name, { size: 'sm' })}<strong>${f.follower_name}</strong></span>
+              <span class="row">${avatar(f.follower_name, { size: 'sm' })}<span><strong>${f.follower_name}</strong>${forWhom(f) ? html` <span class="muted small">wants to follow ${forWhom(f)}</span>` : ''}</span></span>
               <span class="row">
                 <button class="btn btn--sm btn--primary" type="button" data-action="follow-set" data-follow="${f.id}" data-status="approved">Approve</button>
                 <button class="btn btn--sm" type="button" data-action="follow-remove" data-follow="${f.id}">Decline</button>
-                <button class="btn btn--sm btn--quiet" type="button" data-action="follow-set" data-follow="${f.id}" data-status="blocked">Block</button>
+                <button class="btn btn--sm btn--quiet" type="button" data-action="block-person" data-user="${f.follower_id}" data-for="${f.for_user_id}" data-name="${f.follower_name}">Block</button>
               </span>
             </div>`)}
         </div>` : ''}
@@ -66,14 +70,31 @@ export default {
         <details class="card card--flat section-title">
           <summary class="row"><strong>People who follow you</strong> <span class="pill">${others.length}</span></summary>
           <div class="stack">
-            <p class="muted small">Blocking someone removes their access the next time they load anything.</p>
+            <p class="muted small">Blocking someone ends their access straight away, including any list they help with or co-own with you.</p>
             ${others.map(f => html`
               <div class="row row--between">
-                <span class="row">${avatar(f.follower_name, { size: 'sm' })}<span>${f.follower_name}</span>${f.status === 'blocked' ? html`<span class="pill pill--ribbon">Blocked</span>` : ''}</span>
-                ${f.status === 'blocked'
-                  ? html`<button class="btn btn--sm" type="button" data-action="follow-set" data-follow="${f.id}" data-status="approved">Unblock</button>`
-                  : html`<button class="btn btn--sm btn--quiet" type="button" data-action="follow-set" data-follow="${f.id}" data-status="blocked">Block</button>`}
+                <span class="row">${avatar(f.follower_name, { size: 'sm' })}<span>${f.follower_name}${forWhom(f) ? html` <span class="muted small">follows ${forWhom(f)}</span>` : ''}</span></span>
+                <span class="row">
+                  <button class="btn btn--sm btn--quiet" type="button" data-action="follow-remove" data-follow="${f.id}" data-done="Removed">Remove</button>
+                  <button class="btn btn--sm btn--quiet" type="button" data-action="block-person" data-user="${f.follower_id}" data-for="${f.for_user_id}" data-name="${f.follower_name}">Block</button>
+                </span>
               </div>`)}
+          </div>
+        </details>` : ''}
+
+      ${blocked.length ? html`
+        <details class="card card--flat section-title">
+          <summary class="row"><strong>People you have blocked</strong> <span class="pill">${blocked.length}</span></summary>
+          <div class="stack">
+            <p class="muted small">A blocked person cannot open your lists, follow you, or name you on theirs. Reporting someone blocks them too.</p>
+            ${blocked.map(b => {
+              const child = b.blocker_id !== store.session.current_user.id ? (store.session.dependents.find(d => d.id === b.blocker_id)?.name || 'your child') : null;
+              return html`
+              <div class="row row--between">
+                <span class="row">${avatar(b.blocked_name, { size: 'sm' })}<span>${b.blocked_name}${child ? html` <span class="muted small">blocked for ${child}</span>` : ''}</span></span>
+                <button class="btn btn--sm" type="button" data-action="unblock-person" data-user="${b.blocked_id}" data-for="${b.blocker_id}">Unblock</button>
+              </div>`;
+            })}
           </div>
         </details>` : ''}`;
   }
@@ -95,7 +116,7 @@ function personCard(p) {
 
       <div class="meter">
         <div class="meter__top">
-          <span>${budget.limit ? `${money(budget.spent)} of ${money(budget.limit)} budget` : `${money(budget.spent) || '$0'} planned so far`}</span>
+          <span>${budget.limit ? `${money(budget.spent)} of ${money(budget.limit)} budget` : `${money(budget.spent) || '$0'} planned so far`}${budget.not_counted_currencies?.length ? html` <span class="muted small">(gifts priced in ${budget.not_counted_currencies.join(', ')} are not counted)</span>` : ''}</span>
           <button class="btn btn--quiet btn--sm" type="button" data-action="set-budget" data-user="${p.person.id}" data-name="${first}" data-occasion="${budget.occasion}" data-limit="${budget.limit ?? ''}">${budget.limit ? 'Change' : 'Set a budget'}</button>
         </div>
         ${budget.limit ? html`<progress class="${budget.over_budget ? 'is-over' : ''}" max="${budget.limit}" value="${Math.min(budget.spent, budget.limit)}"></progress>` : ''}
@@ -155,18 +176,32 @@ on('send-digest', async () => {
 });
 
 on('follow-set', async (el) => {
-  if (el.dataset.status === 'blocked') {
-    const ok = await confirmSheet({ title: 'Block this person?', message: 'They lose access to your lists and cannot follow you again unless you unblock them.', confirmLabel: 'Block', danger: true });
-    if (!ok) return;
-  }
   await patch(`/api/follows/${el.dataset.follow}`, { status: el.dataset.status });
-  toast(el.dataset.status === 'approved' ? 'Approved' : 'Blocked');
+  toast('Approved');
+  await refresh();
+});
+
+on('block-person', async (el) => {
+  const ok = await confirmSheet({
+    title: `Block ${el.dataset.name}?`,
+    message: 'They lose access to your lists straight away, stop helping with or co-owning any list with you, and cannot follow you again unless you unblock them. They are not told.',
+    confirmLabel: 'Block', danger: true
+  });
+  if (!ok) return;
+  await post('/api/blocks', { user_id: el.dataset.user, for_user_id: el.dataset.for || undefined });
+  toast('Blocked');
+  await refresh();
+});
+
+on('unblock-person', async (el) => {
+  await del(`/api/blocks/${encodeURIComponent(el.dataset.user)}?for=${encodeURIComponent(el.dataset.for)}`);
+  toast('Unblocked. They can ask to follow you again.');
   await refresh();
 });
 
 on('follow-remove', async (el) => {
   await del(`/api/follows/${el.dataset.follow}`);
-  toast('Declined');
+  toast(el.dataset.done || 'Declined');
   await refresh();
 });
 

@@ -6,12 +6,12 @@
  * separately issued token in an Authorization header. Only SHA-256 hashes of
  * tokens are stored.
  *
- * Sign-in is a 6-digit code sent to the email address. A new address becomes
+ * Sign-in is an 8-digit code sent to the email address. A new address becomes
  * an account only after the code has been entered, so nobody can create or
  * enter an account for an address they cannot read.
  */
 
-import { uid, secretToken, sixDigitCode, sha256, safeEqual, inTransaction } from '../db/schema.mjs';
+import { uid, secretToken, signInCode, sha256, safeEqual, inTransaction } from '../db/schema.mjs';
 import { badRequest, forbidden, notFound, tooMany } from '../errors.mjs';
 import { sendNotification } from './notifications.mjs';
 import { cleanText, daysInMonth } from './capture.mjs';
@@ -21,7 +21,7 @@ const SESSION_DAYS = 30;
 const API_TOKEN_DAYS = 365;
 const CHALLENGE_MINUTES = 10;
 const MAX_CODE_ATTEMPTS = 5;
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const EMAIL_RE = /^[^\s@\x00-\x1f\x7f]+@[^\s@\x00-\x1f\x7f]+\.[^\s@\x00-\x1f\x7f]+$/;
 
 export function normalizeEmail(raw) {
   const email = String(raw ?? '').trim().toLowerCase();
@@ -115,7 +115,7 @@ export function startSignIn(db, { email, requester = null }) {
   }
 
   const id = secretToken('chl');
-  const code = sixDigitCode();
+  const code = signInCode();
   db.prepare(`
     INSERT INTO auth_challenges (id, email, code_hash, expires_at, created_at, requester)
     VALUES (?, ?, ?, ?, ?, ?)
@@ -201,6 +201,20 @@ export function completeSignIn(db, { challengeId, code, profile = null, adminEma
       // adding an address grants the role, removing it takes the role away.
       db.prepare('UPDATE users SET is_admin = ? WHERE id = ?').run(adminEmails.has(challenge.email) ? 1 : 0, user.id);
       user = db.prepare('SELECT * FROM users WHERE id = ?').get(user.id);
+    }
+
+    // Reservations this person made as a guest with the same, confirmed,
+    // address become theirs. Both times they proved they read that mailbox,
+    // so nothing depends on a token left behind in whichever browser they used.
+    // (Not on lists they own: an owner never holds claims on their own list.)
+    const asGuest = db.prepare(`
+      SELECT id FROM claims
+      WHERE claimer_user_id IS NULL AND verified = 1 AND LOWER(guest_email) = ?
+        AND list_id NOT IN (SELECT id FROM lists WHERE owner_id = ? OR co_owner_ids LIKE ?)
+    `).all(challenge.email, user.id, `%"${user.id}"%`);
+    for (const c of asGuest) {
+      db.prepare('UPDATE claims SET claimer_user_id = ?, guest_email = NULL, guest_name = NULL, manage_token = ?, updated_at = ? WHERE id = ?')
+        .run(user.id, secretToken('mng'), nowIso, c.id);
     }
 
     let joinedGroup = null;

@@ -46,6 +46,10 @@ function runMigrations(db) {
   if (!claimCols.has('hold_started_at')) {
     db.exec('ALTER TABLE claims ADD COLUMN hold_started_at TEXT;');
   }
+  // Whose name a stored message mentions, so it can be removed with that person.
+  if (!cols('notifications_outbox').has('about_user_id')) {
+    db.exec('ALTER TABLE notifications_outbox ADD COLUMN about_user_id TEXT;');
+  }
   // IANA zone reported by the person's browser; used for quiet hours only.
   if (!cols('users').has('time_zone')) {
     db.exec('ALTER TABLE users ADD COLUMN time_zone TEXT;');
@@ -470,7 +474,7 @@ export function initSchema(db) {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_blocks_pair ON blocks(blocker_id, blocked_id) WHERE blocked_id IS NOT NULL;
     CREATE INDEX IF NOT EXISTS idx_blocks_hash ON blocks(blocked_email_hash);
 
-    -- 23. Passwordless sign-in challenges (6-digit code sent to the email).
+    -- 23. Passwordless sign-in challenges (8-digit code sent to the email).
     CREATE TABLE IF NOT EXISTS auth_challenges (
       id TEXT PRIMARY KEY,
       email TEXT NOT NULL,
@@ -497,6 +501,15 @@ export function uid(prefix = '') {
 export function secretToken(prefix = '') {
   const raw = crypto.randomBytes(24).toString('base64url');
   return prefix ? `${prefix}_${raw}` : raw;
+}
+
+/**
+ * Uniform 8-digit code for signing in. Five tries per code and a capped number
+ * of codes per address bound online guessing; two more digits than the usual
+ * six make that bound a hundred times smaller.
+ */
+export function signInCode() {
+  return String(crypto.randomInt(0, 100_000_000)).padStart(8, '0');
 }
 
 /** Uniform 6-digit code from the CSPRNG (Math.random is not acceptable here). */

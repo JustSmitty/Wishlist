@@ -61,8 +61,11 @@ export function whenLine(iso) {
 export function sparkline(history = []) {
   const prices = history.map(p => Number(p.price)).filter(p => Number.isFinite(p) && p > 0);
   if (prices.length < 2) return '';
-  const min = Math.min(...prices);
-  const range = Math.max(...prices) - min || 1;
+  // A loop, not Math.min(...prices): spreading a long array overflows the stack.
+  let min = Infinity;
+  let max = -Infinity;
+  for (const p of prices) { if (p < min) min = p; if (p > max) max = p; }
+  const range = max - min || 1;
   const points = prices.map((p, i) => `${(2 + (i / (prices.length - 1)) * 52).toFixed(1)},${(15 - ((p - min) / range) * 12).toFixed(1)}`).join(' ');
   return raw(`<svg viewBox="0 0 56 18" aria-hidden="true"><polyline fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="${points}"/></svg>`);
 }

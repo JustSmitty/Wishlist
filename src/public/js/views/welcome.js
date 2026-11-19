@@ -75,7 +75,7 @@ function signIn() {
       <form class="card stack" data-form="signin-email" novalidate>
         <div>
           <h2>Sign in or start a list</h2>
-          <p class="muted small">No password. We send a 6-digit code to your email.</p>
+          <p class="muted small">No password. We send an 8-digit code to your email.</p>
         </div>
         <div class="field">
           <label for="si-email">Email</label>
@@ -93,8 +93,8 @@ function signIn() {
         </div>
         ${state.demoCode ? html`<div class="notice notice--honey">${icon('inbox')}<div>Demo mode does not send email, so the code has been filled in for you.</div></div>` : ''}
         <div class="field">
-          <label for="si-code">6-digit code</label>
-          <input id="si-code" name="code" class="codebox" required inputmode="numeric" autocomplete="one-time-code" maxlength="6" pattern="[0-9]{6}" value="${state.demoCode || ''}" data-autofocus />
+          <label for="si-code">8-digit code</label>
+          <input id="si-code" name="code" class="codebox" required inputmode="numeric" autocomplete="one-time-code" maxlength="8" pattern="[0-9]{8}" value="${state.demoCode || ''}" data-autofocus />
         </div>
         <button class="btn btn--primary btn--block" type="submit">Continue</button>
         <button class="btn btn--quiet btn--block" type="button" data-action="signin-restart">Use a different email</button>

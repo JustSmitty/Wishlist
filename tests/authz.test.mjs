@@ -190,7 +190,11 @@ test("deleting an account erases the person and keeps other people's records", a
     const claim = (await elena.post('/api/claims', { item_id: 'itm_l1', order_note: 'my private note' })).json.claim;
     await elena.del('/api/account', { confirm: true });
     const anon = db.prepare('SELECT * FROM claims WHERE id = ?').get(claim.id);
-    assert.deepEqual([anon.status, anon.claimer_user_id, anon.guest_email, anon.order_note, anon.guest_name], ['reserved', null, null, null, 'Former member']);
+    // A hold she never bought is released (nobody is left who could release it)…
+    assert.deepEqual([anon.status, anon.claimer_user_id, anon.guest_email, anon.order_note, anon.guest_name], ['released', null, null, null, 'Former member']);
+    // …while something she had already bought stays on record, anonymously.
+    const kept = db.prepare("SELECT status, claimer_user_id, guest_name, order_note FROM claims WHERE id = 'clm_elena_on_justin'").get();
+    assert.deepEqual({ ...kept }, { status: 'purchased', claimer_user_id: null, guest_name: 'Former member', order_note: null });
 
     // A child with no remaining guardian is erased with the last one.
     const solo = await app.signUp('solo@example.com', 'Solo Parent');

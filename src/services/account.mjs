@@ -10,7 +10,7 @@
 
 import { inTransaction, secretToken, sha256 } from '../db/schema.mjs';
 import { conflict } from '../errors.mjs';
-import { archiveList, normalizeEmailForCap } from './claims.mjs';
+import { archiveList, normalizeEmailForCap, recordClaimEvent } from './claims.mjs';
 import { removeFromExchanges } from './secret-santa.mjs';
 
 export function deleteAccount(db, userId) {
@@ -55,7 +55,7 @@ function erasePerson(db, userId) {
   // item names stay, because other people's gift records point at them.
   const lists = db.prepare('SELECT * FROM lists WHERE owner_id = ?').all(userId);
   for (const list of lists) {
-    archiveList(db, list, { reason: 'the list owner closed their account' });
+    archiveList(db, list, { reason: 'its owner closed their account', label: 'a wishlist you were giving from' });
     db.prepare(`
       UPDATE lists SET name = 'Closed wishlist', visibility = 'private', co_owner_ids = '[]', cover_image = NULL, share_token = ?
       WHERE id = ?
@@ -72,7 +72,7 @@ function erasePerson(db, userId) {
   // guest with the same address before they had an account. Each record gets
   // a new manage token so no link the person held still opens it.
   const theirClaims = db.prepare(`
-    SELECT id, claimer_user_id, guest_email FROM claims
+    SELECT id, status, claimer_user_id, guest_email FROM claims
     WHERE claimer_user_id = ? OR (claimer_user_id IS NULL AND guest_email IS NOT NULL)
   `).all(userId).filter(c => c.claimer_user_id === userId ||
     (email && normalizeEmailForCap(c.guest_email) === normalizeEmailForCap(email)));
@@ -83,6 +83,12 @@ function erasePerson(db, userId) {
           show_name_to_givers = 0, verification_code = NULL, manage_token = ?, updated_at = ?
       WHERE id = ?
     `).run(secretToken('mng'), nowIso, c.id);
+    // A hold they never bought would otherwise keep the item tied up, with
+    // nobody left who could release it.
+    if (c.status === 'reserved' || c.status === 'pending_verification') {
+      db.prepare("UPDATE claims SET status = 'released', updated_at = ? WHERE id = ?").run(nowIso, c.id);
+      recordClaimEvent(db, c.id, c.status, 'released', 'system', null, 'Released because the giver closed their account', nowIso);
+    }
   }
   // Pledges not yet settled are cancelled; settled ones stay, anonymised.
   db.prepare("UPDATE contributions SET status = 'withdrawn' WHERE contributor_user_id = ? AND status = 'pledged'").run(userId);
@@ -135,7 +141,7 @@ function erasePerson(db, userId) {
   db.prepare('DELETE FROM budgets WHERE owner_id = ? OR subject_user_id = ?').run(userId, userId);
   db.prepare('DELETE FROM occasions WHERE user_id = ?').run(userId);
   db.prepare('DELETE FROM notification_preferences WHERE user_id = ?').run(userId);
-  db.prepare('DELETE FROM notifications_outbox WHERE recipient_user_id = ?').run(userId);
+  db.prepare('DELETE FROM notifications_outbox WHERE recipient_user_id = ? OR about_user_id = ?').run(userId, userId);
   if (email) {
     db.prepare('DELETE FROM notifications_outbox WHERE LOWER(recipient_email) = ?').run(email);
     db.prepare('DELETE FROM auth_challenges WHERE email = ?').run(email);

@@ -88,7 +88,7 @@ function listDetail(list, lists) {
   const active = list.items.filter(i => i.status === 'active');
   const received = list.items.filter(i => i.status === 'received');
   const visible = sortItems(active.filter(i => passesFilter(i) && matchesSearch(i, ui.query)), ui.sort);
-  const canReveal = list.surprise_mode && !list.revealed_at && list.viewer_role === 'owner';
+  const canReveal = list.surprise_mode && !list.revealed_at && list.viewer_role === 'owner' && list.can_manage_people;
 
   return html`
     <section class="card hero" aria-labelledby="list-title">
@@ -100,6 +100,7 @@ function listDetail(list, lists) {
           <span>${icon(list.visibility === 'private' ? 'lock' : 'eye', { size: 17 })} ${VISIBILITY[list.visibility]?.[0] || list.visibility}</span>
           ${list.shared_with_groups?.length ? html`<span>${icon('circle', { size: 17 })} ${list.shared_with_groups.map(g => g.name).join(', ')}</span>` : ''}
           ${list.helpers?.length ? html`<span>${icon('shield', { size: 17 })} Helper: ${list.helpers.map(h => h.name).join(', ')}</span>` : ''}
+          ${list.co_owners?.length ? html`<span>${icon('people', { size: 17 })} Shared with ${list.co_owners.map(c => c.id === me().id ? 'you' : c.name).join(', ')} as co-owner${list.co_owners.length > 1 ? 's' : ''}</span>` : ''}
         </div>
         <div class="hero__actions">
           ${list.archived_at ? html`
@@ -116,6 +117,8 @@ function listDetail(list, lists) {
               ${list.archived_at ? '' : html`
                 <div class="menu__sep"></div>
                 <button class="menu__item menu__item--danger" type="button" role="menuitem" data-action="archive-list" data-list="${list.id}">${icon('box', { size: 18 })} Archive this list</button>`}
+              ${list.can_leave ? html`
+                <button class="menu__item menu__item--danger" type="button" role="menuitem" data-action="leave-list" data-list="${list.id}" data-name="${list.name}">${icon('out', { size: 18 })} Leave this list</button>` : ''}
             </div>
           </details>
         </div>
@@ -286,6 +289,15 @@ async function circleChoices() {
 
 function listFields(list, { groups, people }, isNew) {
   const owners = [{ id: me().id, name: 'Me' }, ...store.session.dependents.map(d => ({ id: d.id, name: d.name }))];
+  // Who sees the list and who helps run it is the owner's call; a co-owner
+  // sees these settings but cannot change them.
+  const manages = isNew || Boolean(list?.can_manage_people);
+  const sharedWith = new Set((list?.shared_with_groups || []).map(g => g.id));
+  // Circles the list is already shared with stay listed even if this person is not in them.
+  const circleOptions = [...groups.map(g => ({ id: g.id, name: g.name })), ...(list?.shared_with_groups || []).filter(g => !groups.some(x => x.id === g.id))];
+  const coOwnerIds = new Set(list?.co_owner_ids || []);
+  const candidates = [...people, ...(list?.co_owners || []).filter(c => !people.some(p => p.id === c.id))];
+  const sealed = list && list.surprise_mode && !list.revealed_at;
   return html`
     ${isNew && owners.length > 1 ? html`
       <div class="field">
@@ -306,29 +318,37 @@ function listFields(list, { groups, people }, isNew) {
       <div class="field">
         <label for="lf-date">Date <span class="muted">(optional)</span></label>
         <input id="lf-date" name="event_date" type="date" value="${list?.event_date || ''}" min="${new Date().toISOString().slice(0, 10)}" />
+        ${sealed ? html`<span class="field__hint">Changing the date never brings the opening forward: a sealed list opens no sooner than it already promised, and at least a week after any change.</span>` : ''}
       </div>
     </div>
-    <fieldset class="field">
-      <legend class="label">Who can see it</legend>
+    <fieldset class="field" ${manages ? '' : raw('disabled')}>
+      <legend class="label">Who can see it${manages ? '' : html` <span class="muted">(only the owner can change this)</span>`}</legend>
       ${Object.entries(VISIBILITY).map(([value, [label, hint]]) => html`
         <label class="check">
           <input type="radio" name="visibility" value="${value}" ${(list?.visibility || 'link') === value ? raw('checked') : ''} />
           <span>${label}<small>${hint}</small></span>
         </label>`)}
+      ${!isNew && list.visibility === 'link' ? html`<span class="field__hint">Taking a list off link sharing retires its link for good. If you share by link again later it gets a new one.</span>` : ''}
     </fieldset>
-    ${isNew && groups.length ? html`
+    ${circleOptions.length ? html`
       <fieldset class="field">
         <legend class="label">Share with your circles</legend>
-        ${groups.map(g => html`<label class="check"><input type="checkbox" name="group:${g.id}" checked /><span>${g.name}</span></label>`)}
+        ${circleOptions.map(g => html`<label class="check"><input type="checkbox" name="group:${g.id}" ${isNew || sharedWith.has(g.id) ? raw('checked') : ''} /><span>${g.name}</span></label>`)}
       </fieldset>` : ''}
-    ${people.length ? html`
+    ${manages && candidates.length ? html`
+      <fieldset class="field">
+        <legend class="label">Co-owners <span class="muted">(optional)</span></legend>
+        ${candidates.map(p => html`<label class="check"><input type="checkbox" name="coowner:${p.id}" ${coOwnerIds.has(p.id) ? raw('checked') : ''} /><span>${p.name}</span></label>`)}
+        <span class="field__hint">A co-owner can add and edit wishes with you. Like you, they do not see reservations on a surprise list. They are told, and can leave whenever they like.</span>
+      </fieldset>` : ''}
+    ${manages && people.length ? html`
       <div class="field">
         <label for="lf-helper">Trusted helper <span class="muted">(optional)</span></label>
         <select id="lf-helper" name="helper_user_id">
           <option value="">Nobody</option>
           ${people.map(p => html`<option value="${p.id}" ${list?.helpers?.some(h => h.id === p.id) ? raw('selected') : ''}>${p.name}</option>`)}
         </select>
-        <span class="field__hint">A helper can see reservations and tidy up mistakes, so you never have to look.</span>
+        <span class="field__hint">A helper can see reservations and tidy up mistakes, so you never have to look. Not someone who owns the list. They are told, and can leave whenever they like.</span>
       </div>` : ''}
     ${isNew ? html`
       <label class="check">
@@ -337,6 +357,8 @@ function listFields(list, { groups, people }, isNew) {
       </label>` : ''}`;
 }
 
+const picked = (values, prefix) => Object.keys(values).filter(k => k.startsWith(prefix) && values[k]).map(k => k.slice(prefix.length));
+
 on('new-list', async () => {
   const choices = await circleChoices();
   openSheet({
@@ -344,10 +366,10 @@ on('new-list', async () => {
     body: listFields(null, choices, true),
     submitLabel: 'Create list',
     onSubmit: async (v) => {
-      const group_ids = Object.keys(v).filter(k => k.startsWith('group:') && v[k]).map(k => k.slice(6));
       const { list } = await post('/api/lists', {
         owner_id: v.owner_id || undefined, name: v.name, occasion: v.occasion, event_date: v.event_date || null,
-        visibility: v.visibility, surprise_mode: v.surprise_mode, helper_user_id: v.helper_user_id || null, group_ids
+        visibility: v.visibility, surprise_mode: v.surprise_mode, helper_user_id: v.helper_user_id || null,
+        group_ids: picked(v, 'group:'), co_owner_ids: picked(v, 'coowner:')
       });
       toast('List created');
       await navigate(`/lists/${list.id}`);
@@ -367,14 +389,35 @@ on('edit-list', async (el) => {
           ? html`This list is still empty, so you can <button class="btn btn--sm" type="button" data-action="surprise-off" data-list="${list.id}">switch it off</button> if you would rather see reservations as they happen.`
           : 'It stays on now that the list has wishes: people may already have reserved things expecting it to be a surprise.'}</div></div>` : ''}`,
     onSubmit: async (v) => {
+      const manages = Boolean(list.can_manage_people);
+      const groupIds = picked(v, 'group:');
+      const before = (list.shared_with_groups || []).map(g => g.id);
+      const coOwners = picked(v, 'coowner:');
+      const same = (a, b) => a.length === b.length && a.every(x => b.includes(x));
       await patch(`/api/lists/${list.id}`, {
-        name: v.name, occasion: v.occasion, event_date: v.event_date || null,
-        visibility: v.visibility, ...(v.helper_user_id !== undefined ? { helper_user_id: v.helper_user_id || null } : {})
+        name: v.name, occasion: v.occasion,
+        ...((v.event_date || null) !== (list.event_date || null) ? { event_date: v.event_date || null } : {}),
+        ...(manages && v.visibility ? { visibility: v.visibility } : {}),
+        ...(same(groupIds, before) ? {} : { group_ids: groupIds }),
+        ...(manages && !same(coOwners, list.co_owner_ids || []) ? { co_owner_ids: coOwners } : {}),
+        ...(manages && v.helper_user_id !== undefined ? { helper_user_id: v.helper_user_id || null } : {})
       });
       toast('Saved');
       await refresh();
     }
   });
+});
+
+on('leave-list', async (el) => {
+  const ok = await confirmSheet({
+    title: `Leave "${el.dataset.name}"?`,
+    message: 'You will no longer be able to edit this list. Its owner can add you again later.',
+    confirmLabel: 'Leave', danger: true
+  });
+  if (!ok) return;
+  await patch(`/api/lists/${el.dataset.list}`, { action: 'leave' });
+  toast('You left the list');
+  await navigate('/');
 });
 
 on('surprise-off', async (el) => {
@@ -401,10 +444,11 @@ on('reuse-list', (el) => {
   const list = findList(el.dataset.list);
   openSheet({
     title: 'Reopen this list',
-    intro: 'It becomes shareable again and is sealed for the new occasion.',
+    intro: 'It becomes shareable again and is sealed for the new occasion. The old date does not carry over.',
     size: 'narrow',
-    body: html`<div class="field"><label for="ru-date">New date <span class="muted">(optional)</span></label>
-      <input id="ru-date" name="event_date" type="date" min="${new Date().toISOString().slice(0, 10)}" /></div>`,
+    body: html`<div class="field"><label for="ru-date">Date of the new occasion <span class="muted">(optional)</span></label>
+      <input id="ru-date" name="event_date" type="date" min="${new Date().toISOString().slice(0, 10)}" />
+      <span class="field__hint">Without a date the list stays sealed until you add one. It can be opened a week after the date.</span></div>`,
     submitLabel: 'Reopen',
     onSubmit: async (v) => {
       await patch(`/api/lists/${list.id}`, { action: 'reuse', event_date: v.event_date || null });
@@ -473,7 +517,8 @@ on('native-share', async (el) => {
   try { await navigator.share({ title: el.dataset.title, url: el.dataset.url }); } catch { /* dismissed */ }
 });
 
-on('new-child', () => {
+on('new-child', async () => {
+  const { groups } = await circleChoices();
   openSheet({
     title: 'Add a child',
     intro: 'Children do not get a sign-in or an email address. You look after their list, and as their guardian you can see what has been reserved.',
@@ -483,11 +528,18 @@ on('new-child', () => {
         <div class="field"><label for="ch-month">Birthday month</label>
           <select id="ch-month" name="birthday_month"><option value="">—</option>${['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'].map((m, i) => html`<option value="${i + 1}">${m}</option>`)}</select></div>
         <div class="field"><label for="ch-day">Day</label><input id="ch-day" name="birthday_day" type="number" min="1" max="31" inputmode="numeric" /></div>
-      </div>`,
+      </div>
+      ${groups.length ? html`
+        <fieldset class="field">
+          <legend class="label">Share their list with</legend>
+          ${groups.map(g => html`<label class="check"><input type="checkbox" name="group:${g.id}" /><span>${g.name}</span></label>`)}
+          <span class="field__hint">A child's list is never public. Only the circles you tick here can see it, and you can change this later under "Edit details".</span>
+        </fieldset>` : html`<p class="small muted">A child's list is never public. Once you are in a circle you can share it there under "Edit details".</p>`}`,
     submitLabel: 'Add child',
     onSubmit: async (v) => {
       const res = await post('/api/dependents', {
-        name: v.name, birthday_month: v.birthday_month ? Number(v.birthday_month) : null, birthday_day: v.birthday_day ? Number(v.birthday_day) : null
+        name: v.name, birthday_month: v.birthday_month ? Number(v.birthday_month) : null, birthday_day: v.birthday_day ? Number(v.birthday_day) : null,
+        group_ids: picked(v, 'group:')
       });
       store.session.dependents.push({ id: res.dependent.id, name: res.dependent.name });
       toast(`${res.dependent.name}'s list is ready`);
@@ -744,6 +796,11 @@ on('move-item', (el) => {
   const targets = data().lists.filter(l => l.id !== list.id && l.owner_id === list.owner_id && !l.archived_at);
   openSheet({
     title: copy ? 'Copy to another list' : 'Move to another list',
+    intro: copy
+      ? 'The copy starts fresh: nobody has reserved it.'
+      : (list.surprise_mode && !list.revealed_at
+        ? 'Anyone giving this is told where it went. The list it moves to stays sealed at least as long as this one, and for at least a week from today.'
+        : 'Anyone giving this is told where it went.'),
     size: 'narrow',
     body: html`<div class="field"><label for="mv-target">List</label>
       <select id="mv-target" name="target">${targets.map(t => html`<option value="${t.id}">${t.name}</option>`)}</select></div>`,

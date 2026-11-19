@@ -10,12 +10,28 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * Manage tokens for reservations made as a guest in this browser, one per
+ * reservation, newest last. Sent only while nobody is signed in (the server
+ * ignores them otherwise) and forgotten at sign-in and sign-out, so they do
+ * not pass to the next person on a shared computer.
+ */
 export function guestToken() {
-  try { return localStorage.getItem(GUEST_TOKEN_KEY) || ''; } catch { return ''; }
+  try {
+    return (localStorage.getItem(GUEST_TOKEN_KEY) || '').split(',').filter(Boolean).slice(-20).join(',');
+  } catch { return ''; }
 }
 
 export function rememberGuestToken(token) {
-  try { localStorage.setItem(GUEST_TOKEN_KEY, token); } catch { /* private mode */ }
+  if (typeof token !== 'string' || !token || token.includes(',')) return;
+  try {
+    const kept = guestToken().split(',').filter(t => t && t !== token);
+    localStorage.setItem(GUEST_TOKEN_KEY, [...kept, token].slice(-20).join(','));
+  } catch { /* private mode */ }
+}
+
+export function forgetGuestTokens() {
+  try { localStorage.removeItem(GUEST_TOKEN_KEY); } catch { /* private mode */ }
 }
 
 export async function api(path, { method = 'GET', body } = {}) {

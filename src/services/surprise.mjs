@@ -18,6 +18,7 @@
  *             their own claim. No other reservation, pledge or amount.
  */
 
+import { safeEqual } from '../db/schema.mjs';
 import {
   isGuardianOf, isBlockedBy, sharesGroup, inSameCircle, hasApprovedFollow
 } from './access.mjs';
@@ -139,12 +140,13 @@ export function sanitizeItemForViewer(db, item, list, viewerCtx, viewerUserId = 
     updated_at: item.updated_at
   };
 
-  const priceHistory = db.prepare(`
-    SELECT price, in_stock, checked_at
-    FROM price_snapshots
-    WHERE item_id = ?
-    ORDER BY checked_at ASC
-  `).all(item.id);
+  // Bounded: the starting point plus the most recent changes.
+  const first = db.prepare('SELECT price, in_stock, checked_at FROM price_snapshots WHERE item_id = ? ORDER BY checked_at ASC LIMIT 1').get(item.id);
+  const recent = db.prepare(`
+    SELECT price, in_stock, checked_at FROM price_snapshots
+    WHERE item_id = ? ORDER BY checked_at DESC LIMIT 59
+  `).all(item.id).reverse();
+  const priceHistory = first && recent.length && recent[0].checked_at !== first.checked_at ? [first, ...recent] : recent;
   baseItem.price_history = priceHistory;
   if (priceHistory.length >= 2) {
     const firstPrice = priceHistory[0].price;
@@ -197,7 +199,7 @@ export function sanitizeItemForViewer(db, item, list, viewerCtx, viewerUserId = 
   const sanitizedClaims = activeClaims.map(c => {
     const isOwnClaim = Boolean(
       (viewerUserId && c.claimer_user_id === viewerUserId) ||
-      (!c.claimer_user_id && viewerCtx.guestClaimToken && c.manage_token === viewerCtx.guestClaimToken)
+      (!c.claimer_user_id && holdsManageToken(c.manage_token, viewerCtx.guestClaimToken))
     );
     const canSeeName = isOwnClaim || privileged || (viewerCtx.canSeeClaimerNames && Boolean(c.show_name_to_givers));
     // A guest's email address is never used as a display name.
@@ -258,6 +260,18 @@ export function sanitizeItemForViewer(db, item, list, viewerCtx, viewerUserId = 
       contributions: sanitizedContributions
     }
   };
+}
+
+/**
+ * True when one of the manage tokens a guest's browser presented is this
+ * claim's. A browser keeps one token per reservation it made.
+ */
+export function holdsManageToken(claimToken, presented) {
+  if (!claimToken || !presented) return false;
+  const list = Array.isArray(presented) ? presented : [presented];
+  let found = false;
+  for (const token of list) if (safeEqual(claimToken, token)) found = true;
+  return found;
 }
 
 export function safeJsonParse(str, fallback) {

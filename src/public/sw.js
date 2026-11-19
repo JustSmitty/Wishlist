@@ -1,7 +1,7 @@
 // Network-first for the app shell so a new release is picked up straight
 // away; the cache is only an offline fallback. Nothing under /api/ is ever
 // cached: responses there are per-person.
-const CACHE = 'hushlist-shell-v2';
+const CACHE = 'hushlist-shell-v3';
 const SHELL = [
   '/', '/styles.css', '/manifest.webmanifest', '/fonts/fraunces-latin.woff2', '/icons/icon.svg',
   '/js/theme.js', '/js/main.js', '/js/app.js', '/js/dom.js', '/js/api.js', '/js/icons.js', '/js/parts.js',

@@ -49,6 +49,7 @@ export default {
               ${isOwner ? html`<a class="btn" href="/lists/${list.id}" data-link>${icon('back', { size: 18 })} Back to editing</a>` : ''}
               ${!me() ? html`<a class="btn" href="/welcome" data-link>Make your own list</a>` : ''}
               ${me() && list.viewer_role === 'guest' ? html`<button class="btn" type="button" data-action="follow-owner" data-user="${list.owner_id}">${icon('people', { size: 18 })} Follow ${first}</button>` : ''}
+              ${list.can_leave && !isOwner ? html`<button class="btn btn--quiet" type="button" data-action="stop-helping" data-list="${list.id}" data-name="${first}">Stop being ${first}'s helper</button>` : ''}
             </div>`}
         </div>
         <div class="hero__aside">
@@ -119,7 +120,7 @@ function availability(item) {
   if (!cs) return '';
   if (cs.is_fully_claimed) return html`<span class="wish__state"><span class="pill">${icon('check', { size: 14 })} Taken</span></span>`;
   if (item.always_wanted) return html`<span class="wish__state"><span class="pill pill--pine">Always welcome</span></span>`;
-  if (cs.qty_claimed > 0) return html`<span class="wish__state"><span class="pill pill--honey">${cs.qty_remaining} of ${item.qty_wanted} left</span></span>`;
+  if (cs.qty_remaining !== null && cs.qty_remaining < item.qty_wanted) return html`<span class="wish__state"><span class="pill pill--honey">${cs.qty_remaining} of ${item.qty_wanted} left</span></span>`;
   return html`<span class="wish__state"><span class="pill pill--pine">Available</span></span>`;
 }
 
@@ -129,7 +130,10 @@ function giverCard(item, list) {
   const mine = cs?.claims.find(c => c.is_own_claim);
   const myPledge = cs?.contributions.find(c => c.is_own);
   const canGive = list.viewer_role !== 'owner' && !list.archived_at;
-  const showChipIn = cs && item.allow_group_chip_in && item.price > 0;
+  // Pledges are for people the owner has a connection with, so someone who
+  // only holds the link is not shown them (the server does not send them).
+  const showChipIn = cs && item.allow_group_chip_in && item.price > 0 && cs.pledged_target !== undefined;
+  const chipInHint = cs && item.allow_group_chip_in && item.price > 0 && !showChipIn && !taken;
 
   return html`
     <article class="card wish${taken ? ' wish--taken' : ''}">
@@ -144,6 +148,8 @@ function giverCard(item, list) {
             <progress max="${cs.pledged_target}" value="${Math.min(cs.pledged_total, cs.pledged_target)}">${Math.round((cs.pledged_total / cs.pledged_target) * 100)}%</progress>
             ${cs.contributions.length ? html`<div class="small muted">${cs.contributions.map(c => `${c.contributor_display} ${money(c.pledged_amount, c.currency)}`).join(' · ')}</div>` : ''}
           </div>` : ''}
+
+        ${chipInHint ? html`<p class="small muted">${icon('coin', { size: 14 })} This is a group gift. People in ${list.owner_name.split(' ')[0]}'s circle, and followers they have approved, can chip in toward it.</p>` : ''}
 
         ${cs && cs.claims.length > 0 ? html`
           <div class="wish__claims">
@@ -335,6 +341,18 @@ on('withdraw-pledge', async (el) => {
   if (!ok) return;
   await del(`/api/contributions/${el.dataset.pledge}`);
   toast('Pledge withdrawn');
+  await refresh();
+});
+
+on('stop-helping', async (el) => {
+  const ok = await confirmSheet({
+    title: 'Stop helping with this list?',
+    message: `You will see it like any other giver. ${el.dataset.name} can ask you again later.`,
+    confirmLabel: 'Stop helping'
+  });
+  if (!ok) return;
+  await patch(`/api/lists/${el.dataset.list}`, { action: 'leave' });
+  toast('You are no longer the helper for this list');
   await refresh();
 });
 

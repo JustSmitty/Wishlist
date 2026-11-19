@@ -325,9 +325,16 @@ export function cleanDate(val) {
  */
 export function toProxiedImageUrl(rawImageUrl) {
   if (!rawImageUrl || typeof rawImageUrl !== 'string') return null;
-  if (rawImageUrl.startsWith('/api/image-proxy')) return rawImageUrl.slice(0, 2048);
-  if (!checkUrlSafety(rawImageUrl).safe) return null;
-  return `/api/image-proxy?url=${encodeURIComponent(rawImageUrl.trim())}`;
+  let source = rawImageUrl.trim();
+  // An already-wrapped value is unwrapped and checked again like any other,
+  // so nothing but "/api/image-proxy?url=<a checked address>" is ever stored.
+  if (source.startsWith('/api/image-proxy?url=')) {
+    try { source = decodeURIComponent(source.slice('/api/image-proxy?url='.length).split('&')[0]); } catch { return null; }
+  } else if (source.startsWith('/')) {
+    return null;
+  }
+  if (source.length > 1900 || !checkUrlSafety(source).safe) return null;
+  return `/api/image-proxy?url=${encodeURIComponent(source.toWellFormed())}`;
 }
 
 /**
@@ -579,8 +586,11 @@ export function cleanFieldConfidence(input) {
  * the page is tokenised once into tags with a bounded pattern, and block
  * contents are located with indexOf rather than lazy [\s\S]*? spans.
  */
-const TAG_RE = /<([a-zA-Z][a-zA-Z0-9]*)\b([^<>]{0,4000})>/g;
-const ATTR_RE = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/g;
+const TAG_RE = /<([a-zA-Z][a-zA-Z0-9]*)\b([^<>]{0,2000})>/g;
+// The lookbehind makes a name match start only at the start of a name. Without
+// it, a long run of name characters with no "=" is rescanned from every
+// position in the run, which is quadratic.
+const ATTR_RE = /(?<![-a-zA-Z0-9_:.])([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/g;
 const MAX_TAGS = 20000;
 
 function parseAttributes(raw) {
@@ -846,7 +856,9 @@ function formatStoreName(hostname) {
     potterybarn: 'Pottery Barn',
     barnesandnoble: 'Barnes & Noble'
   };
-  return special[base.toLowerCase()] || (base.charAt(0).toUpperCase() + base.slice(1));
+  // Own keys only: a shop called "constructor" must not find Object's.
+  const key = base.toLowerCase();
+  return Object.hasOwn(special, key) ? special[key] : (base.charAt(0).toUpperCase() + base.slice(1));
 }
 
 function inferTitleFromUrl(url) {
@@ -1029,6 +1041,8 @@ export function importAmazonList(db, { listId, canEdit, amazonListUrl, itemsPayl
  * - Fires immediate notifications to active claimers on a price drop >= 10% or out-of-stock transition.
  * - Records non-spoiler events for follower digests (NTF-1).
  */
+export const MAX_PRICE_POINTS = 60;
+
 export function recheckItemPriceAndStock(db, { itemId, newPrice, newInStock = true, sendNotificationFn = null }) {
   const item = db.prepare("SELECT * FROM items WHERE id = ? AND status = 'active'").get(itemId);
   if (!item) throw notFound('Item not found');
@@ -1052,9 +1066,21 @@ export function recheckItemPriceAndStock(db, { itemId, newPrice, newInStock = tr
       uid('ps'), item.id, oldPrice, oldInStock, item.created_at
     );
   }
-  db.prepare('INSERT INTO price_snapshots (id, item_id, price, in_stock, checked_at) VALUES (?, ?, ?, ?, ?)').run(
-    uid('ps'), item.id, parsedPrice, inStockFlag, nowIso
-  );
+  // History records changes. Re-entering the same price and stock adds nothing,
+  // and the history is kept to a fixed length (the first point, which price
+  // drops are measured from, is always kept).
+  if (parsedPrice !== oldPrice || inStockFlag !== oldInStock || !hasHistory) {
+    db.prepare('INSERT INTO price_snapshots (id, item_id, price, in_stock, checked_at) VALUES (?, ?, ?, ?, ?)').run(
+      uid('ps'), item.id, parsedPrice, inStockFlag, nowIso
+    );
+    db.prepare(`
+      DELETE FROM price_snapshots WHERE item_id = ? AND id NOT IN (
+        SELECT id FROM (SELECT id FROM price_snapshots WHERE item_id = ? ORDER BY checked_at ASC LIMIT 1)
+        UNION
+        SELECT id FROM (SELECT id FROM price_snapshots WHERE item_id = ? ORDER BY checked_at DESC LIMIT ?)
+      )
+    `).run(item.id, item.id, item.id, MAX_PRICE_POINTS - 1);
+  }
 
   db.prepare('UPDATE items SET price = ?, in_stock = ?, updated_at = ? WHERE id = ?').run(
     parsedPrice, inStockFlag, nowIso, item.id

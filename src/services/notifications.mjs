@@ -50,7 +50,10 @@ export function setMailTransport(fn) {
 }
 
 export function consoleMailTransport({ to, subject, body }) {
-  console.log(`[mail:console] to=${to}\n  subject: ${subject}\n  ${String(body).replace(/\n/g, '\n  ')}`);
+  // Addresses and text come from people; control characters must not reach
+  // the operator's terminal as anything but visible escapes.
+  const visible = (text) => String(text).replace(/[\x00-\x09\x0b-\x1f\x7f\x9b]/g, c => `\\x${c.charCodeAt(0).toString(16).padStart(2, '0')}`);
+  console.log(`[mail:console] to=${visible(to)}\n  subject: ${visible(subject)}\n  ${visible(body).replace(/\n/g, '\n  ')}`);
 }
 
 export function sendNotification(db, {
@@ -60,6 +63,7 @@ export function sendNotification(db, {
   subject,
   body,
   storedBody = null,
+  aboutUserId = null,
   listId = null,
   channel = 'email'
 }) {
@@ -68,6 +72,15 @@ export function sendNotification(db, {
     if (u) recipientEmail = u.email;
   }
   if (!recipientEmail) return { skipped: true, reason: 'no_email' };
+
+  // A message about a list usually names it, and a list is usually named
+  // after its owner. Recording whose list it was lets the message be removed
+  // from other people's inboxes if that person closes their account.
+  // (Pass aboutUserId: false for a message that deliberately names nobody.)
+  if (aboutUserId === null && listId) {
+    aboutUserId = db.prepare('SELECT owner_id FROM lists WHERE id = ?').get(listId)?.owner_id || null;
+  }
+  if (aboutUserId === false) aboutUserId = null;
 
   if (listId && SPOILER_EVENT_TYPES.has(eventType)) {
     const list = db.prepare('SELECT * FROM lists WHERE id = ?').get(listId);
@@ -127,8 +140,8 @@ export function sendNotification(db, {
   db.prepare(`
     INSERT INTO notifications_outbox (
       id, recipient_user_id, recipient_email, event_type, subject, body,
-      channel, transactional, unsubscribe_token, scheduled_for, sent_at, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      channel, transactional, unsubscribe_token, scheduled_for, sent_at, created_at, about_user_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
     recipientUserId,
@@ -141,7 +154,8 @@ export function sendNotification(db, {
     unsubToken,
     scheduledFor.toISOString(),
     immediate ? nowIso : null,
-    nowIso
+    nowIso,
+    aboutUserId
   );
 
   if (immediate && mailTransport) {
@@ -206,7 +220,7 @@ function minuteOfDayInZone(date, timeZone) {
 
 /**
  * Follower digest: changes since the reader's last digest on lists they
- * follow. At most one per UTC day. Never includes the reader's own lists, a
+ * follow. At most one in any twenty hours. Never includes the reader's own lists, a
  * list the reader could not open right now (private, blocked, share removed),
  * or an item that has since been removed or moved elsewhere.
  */
@@ -223,7 +237,9 @@ export function generateFollowerDigest(db, { followerUserId }) {
     ORDER BY created_at DESC LIMIT 1
   `).get(follower.id)?.created_at || null;
 
-  if (last && last.slice(0, 10) === now.toISOString().slice(0, 10)) {
+  // One a day, measured on the clock rather than the calendar, so two cannot
+  // be had a minute apart either side of midnight.
+  if (last && now.getTime() - new Date(last).getTime() < 20 * 3600 * 1000) {
     return { already_sent_today: true };
   }
 
