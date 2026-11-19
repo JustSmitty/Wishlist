@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="robots" content="noindex, nofollow" />
+  <meta name="theme-color" content="#3730a3" />
+  <title>Hushlist — Universal Wishlist (Zero Spoilers, Any Store)</title>
+  <link rel="manifest" href="/manifest.webmanifest" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="top-header" role="banner">
+    <div class="header-inner">
+      <div class="brand">
+        <div class="brand-logo" aria-hidden="true">H</div>
+        <div>
+          <h1 class="brand-title">Hushlist</h1>
+          <p class="brand-tagline">Every wish, any store — zero spoilers &amp; zero exposed addresses</p>
+        </div>
+      </div>
+
+      <div style="display:flex; flex-wrap:wrap; align-items:center; gap:0.75rem;">
+        <div class="persona-switcher">
+          <label for="persona-select">Viewing As:</label>
+          <select id="persona-select" aria-label="Switch active persona or Guest view"></select>
+        </div>
+        <button id="btn-quick-signup" class="btn btn-secondary btn-sm" type="button">+ Invite / Join</button>
+      </div>
+    </div>
+  </header>
+
+  <nav class="nav-bar" aria-label="Primary navigation">
+    <div class="nav-inner">
+      <button class="nav-tab active" data-tab="my-lists" type="button">My Wishlists &amp; Kids</button>
+      <button class="nav-tab" data-tab="dashboard" type="button">People I Shop For</button>
+      <button class="nav-tab" data-tab="my-claims" type="button">My Claims Tracker</button>
+      <button class="nav-tab" data-tab="shared-giver" type="button">Giver / Shared Link View</button>
+      <button class="nav-tab" data-tab="groups" type="button">Family Groups &amp; Secret Santa</button>
+      <button class="nav-tab" data-tab="inbox" type="button">Notification Inbox</button>
+      <button class="nav-tab" data-tab="admin" type="button">Admin &amp; Capture Config</button>
+    </div>
+  </nav>
+
+  <main class="container" id="app-root" role="main">
+    <p>Loading Hushlist...</p>
+  </main>
+
+  <div id="modal-root"></div>
+  <div id="toast-root" class="toast-container" aria-live="polite"></div>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

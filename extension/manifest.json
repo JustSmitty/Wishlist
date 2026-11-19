@@ -1,0 +1,15 @@
+{
+  "manifest_version": 3,
+  "name": "Hushlist — Universal Wishlist Save Button",
+  "version": "1.0.0",
+  "description": "Save any product from any store (including Amazon) to your Hushlist wishlist in under 10 seconds. Zero affiliate cookie injection.",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage"
+  ],
+  "action": {
+    "default_title": "Save to Hushlist",
+    "default_popup": "popup.html"
+  }
+}

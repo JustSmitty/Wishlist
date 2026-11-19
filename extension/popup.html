@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Save to Hushlist</title>
+  <style>
+    body {
+      width: 360px;
+      margin: 0;
+      padding: 14px;
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #f8fafc;
+      color: #0f172a;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 10px;
+    }
+    .header h1 {
+      font-size: 16px;
+      margin: 0;
+      color: #3730a3;
+    }
+    .field {
+      margin-bottom: 8px;
+    }
+    .field label {
+      display: block;
+      font-size: 12px;
+      font-weight: 700;
+      margin-bottom: 3px;
+    }
+    .field input, .field select {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 6px 8px;
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      font-size: 13px;
+    }
+    .low-conf {
+      border: 2px solid #d97706 !important;
+      background: #fffbeb !important;
+    }
+    .btn {
+      width: 100%;
+      padding: 9px;
+      border: none;
+      border-radius: 8px;
+      background: #3730a3;
+      color: #fff;
+      font-weight: 700;
+      cursor: pointer;
+      margin-top: 6px;
+    }
+    .status {
+      font-size: 12px;
+      margin-top: 8px;
+      padding: 6px;
+      border-radius: 6px;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>Hushlist — 1-Click Save</h1>
+    <span style="font-size:11px; color:#475569;">activeTab Only · Zero Spoilers</span>
+  </div>
+
+  <div class="field">
+    <label for="ext-list">Destination Wishlist</label>
+    <select id="ext-list"></select>
+  </div>
+  <div class="field">
+    <label for="ext-title">Product Title</label>
+    <input id="ext-title" />
+  </div>
+  <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+    <div class="field">
+      <label for="ext-price">Price ($)</label>
+      <input id="ext-price" type="number" step="0.01" />
+    </div>
+    <div class="field">
+      <label for="ext-store">Store</label>
+      <input id="ext-store" />
+    </div>
+  </div>
+  <div class="field">
+    <label for="ext-variant">Selected Size / Color Variant</label>
+    <input id="ext-variant" placeholder="Size / Color" />
+  </div>
+  <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">
+    <div class="field">
+      <label for="ext-qty">Qty</label>
+      <input id="ext-qty" type="number" min="1" value="1" />
+    </div>
+    <div class="field">
+      <label for="ext-priority">Priority</label>
+      <select id="ext-priority">
+        <option value="most_wanted">★ Most Wanted</option>
+        <option value="high">High</option>
+        <option value="normal" selected>Wanted</option>
+        <option value="low">Nice to Have</option>
+      </select>
+    </div>
+  </div>
+  <div class="field">
+    <label for="ext-notes">Notes</label>
+    <input id="ext-notes" placeholder="Optional note for gift-givers" />
+  </div>
+
+  <button id="ext-save" class="btn" type="button">Save to Hushlist</button>
+  <div id="ext-status" class="status"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
