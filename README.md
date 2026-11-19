@@ -25,7 +25,7 @@ Demo mode is **on by default** unless `NODE_ENV=production` or `HUSHLIST_DEMO=0`
 - A sample family (the Smiths) is loaded so there is something to look at.
 - The welcome page offers one-click sign-in as any sample person, and a "Switch person" control stays visible. The same list looks different to its owner, to family, and to a guest with the link — that is the point of the demo.
 - Sign-in codes and guest verification codes are shown in the app, because no email is sent.
-- The server listens on `127.0.0.1` only. One-click sign-in means anyone who can reach the server can be anyone, so it must not be reachable from another machine.
+- The server listens on `127.0.0.1` only, refuses to start on any other address, and only answers requests addressed to `localhost` or `127.0.0.1`. One-click sign-in means anyone who can reach the server can be anyone, so it must not be reachable from another machine or through another site.
 
 Do not expose a demo-mode server to a network.
 
@@ -37,6 +37,7 @@ Do not expose a demo-mode server to a network.
 | `HOST` | `127.0.0.1` in demo mode, otherwise `0.0.0.0` | Address to bind. |
 | `HUSHLIST_DB` | `data/hushlist.sqlite` | Database file. |
 | `HUSHLIST_DEMO` | on unless `NODE_ENV=production` | `0` turns demo mode off, `1` forces it on. |
+| `HUSHLIST_DEMO_ALLOW_REMOTE` | off | `1` lets a demo-mode server bind to and answer on non-local addresses. Avoid: in demo mode anyone who can reach it can sign in as anyone. |
 | `HUSHLIST_ADMIN_EMAILS` | none | Comma-separated addresses that become administrators when they sign in. |
 | `HUSHLIST_SECURE_COOKIES` | off | `1` adds `Secure` to the session cookie. Set it when serving over HTTPS. |
 | `HUSHLIST_TRUST_PROXY` | off | `1` takes the client address from `X-Forwarded-For` (only behind a proxy you control). |

@@ -103,6 +103,13 @@ export function createApp(customDb = null, options = {}) {
     const method = req.method;
     const isApi = pathname.startsWith('/api/');
 
+    // Demo mode hands out sessions without a secret, so it only answers when
+    // addressed as this machine. That also defeats DNS rebinding, where a web
+    // page points its own hostname at 127.0.0.1 to reach a local server.
+    if (config.demoMode && !config.demoAllowRemote && !isLoopbackHost(req.headers.host)) {
+      throw new AppError('Demo mode only answers on localhost. Open http://localhost on the machine running Hushlist, or turn demo mode off.', 421);
+    }
+
     // ----- Cross-origin policy ------------------------------------------------
     // The browser extension is the only cross-origin caller. It authenticates
     // with a bearer token, never with cookies, so no credentials are allowed.
@@ -1493,6 +1500,12 @@ function respondWithError(res, err) {
   }
 }
 
+function isLoopbackHost(hostHeader) {
+  if (typeof hostHeader !== 'string') return false;
+  const host = hostHeader.trim().toLowerCase().replace(/:\d{1,5}$/, '');
+  return host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
+}
+
 function decodeSegment(segment) {
   try {
     return decodeURIComponent(segment);
@@ -1661,6 +1674,14 @@ function renderPlaceholderSvg(label, theme) {
 // Start the server when run directly.
 if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(__filename)) {
   const { server, config } = createApp();
+  const boundLocally = ['127.0.0.1', '::1', 'localhost'].includes(config.host);
+  if (config.demoMode && !boundLocally && !config.demoAllowRemote) {
+    console.error(
+      `Refusing to start: demo mode lets anyone who can reach the server sign in as anyone, and HOST=${config.host} is not this machine only.\n` +
+      'Set HUSHLIST_DEMO=0 for a real install, or HUSHLIST_DEMO_ALLOW_REMOTE=1 if you really mean to expose a demo.'
+    );
+    process.exit(1);
+  }
   server.listen(config.port, config.host, () => {
     const shown = config.host === '0.0.0.0' ? 'localhost' : config.host;
     console.log(`Hushlist is running at http://${shown}:${config.port}`);

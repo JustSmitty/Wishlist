@@ -19,15 +19,17 @@ function raw(base, request) {
 test('malformed requests get a 400 and the server stays up', async () => {
   const app = await startApp();
   try {
+    // Each of the first four used to end the process with an unhandled rejection.
     for (const request of [
-      'GET // HTTP/1.1\r\nHost: x\r\n\r\n',
-      'GET http:// HTTP/1.1\r\nHost: x\r\n\r\n',
+      'GET // HTTP/1.1\r\nHost: localhost\r\n\r\n',
+      'GET http:// HTTP/1.1\r\nHost: localhost\r\n\r\n',
       'GET /api/session HTTP/1.1\r\nHost: [\r\n\r\n',
-      'GET /%E0%A4%A HTTP/1.1\r\nHost: x\r\n\r\n',
-      'GET /api/lists/%E0%A4%A HTTP/1.1\r\nHost: x\r\n\r\n'
+      'GET /api/session HTTP/1.1\r\nHost: a b\r\n\r\n',
+      'GET /%E0%A4%A HTTP/1.1\r\nHost: localhost\r\n\r\n',
+      'GET /api/lists/%E0%A4%A HTTP/1.1\r\nHost: localhost\r\n\r\n'
     ]) {
       const response = await raw(app.base, request);
-      assert.match(response, /^HTTP\/1\.1 (400|404|200)/, request.split('\r\n')[0]);
+      assert.match(response, /^HTTP\/1\.1 4\d\d/, request.split('\r\n').slice(0, 2).join(' | '));
     }
     assert.equal((await app.guest.get('/api/session')).status, 200, 'still serving');
   } finally { await app.close(); }
@@ -140,4 +142,21 @@ test('CSV export neutralises spreadsheet formulas', async () => {
     assert.ok(csv.includes(`'@SUM(1+1)`));
     assert.ok(!/(^|,)[=@]/m.test(csv), 'no cell starts with a formula character');
   } finally { await app.close(); }
+});
+
+test('demo mode only answers when addressed as this machine (DNS rebinding)', async () => {
+  const app = await startApp();
+  try {
+    const rebound = await raw(app.base, 'POST /api/auth/demo-login HTTP/1.1\r\nHost: attacker.example\r\nContent-Type: application/json\r\nContent-Length: 24\r\n\r\n{"user_id":"usr_justin"}');
+    assert.match(rebound, /^HTTP\/1\.1 421/);
+    assert.ok(!/set-cookie/i.test(rebound));
+    const page = await raw(app.base, 'GET / HTTP/1.1\r\nHost: 192.168.1.20:3456\r\n\r\n');
+    assert.match(page, /^HTTP\/1\.1 421/);
+  } finally { await app.close(); }
+
+  // Outside demo mode any host name is served; sessions there need a real sign-in.
+  const real = await startApp({ demoMode: false });
+  try {
+    assert.match(await raw(real.base, 'GET /api/session HTTP/1.1\r\nHost: hushlist.example\r\n\r\n'), /^HTTP\/1\.1 200/);
+  } finally { await real.close(); }
 });

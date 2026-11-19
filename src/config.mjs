@@ -15,6 +15,9 @@ export function loadConfig(env = process.env) {
 
   return {
     demoMode,
+    // Explicit opt-in to serving demo mode beyond this machine. Not recommended:
+    // in demo mode anyone who can reach the server can sign in as anyone.
+    demoAllowRemote: env.HUSHLIST_DEMO_ALLOW_REMOTE === '1',
     port: Number(env.PORT) || 3456,
     host: env.HOST || (demoMode ? '127.0.0.1' : '0.0.0.0'),
     secureCookies: env.HUSHLIST_SECURE_COOKIES === '1',
