@@ -1,6 +1,7 @@
 /**
- * Seeds top 30 Retailer Adapters (Section 7 & 17) and the Smith Family demo dataset
- * so Hushlist launches with rich, realistic multi-user data ready for immediate exploration.
+ * Seed data: the retailer adapter configuration (always) and the sample
+ * "Smith family" (demo mode only). Sample addresses use the reserved
+ * .example domain so they can never belong to a real person.
  */
 
 export const TOP_30_RETAILER_ADAPTERS = [
@@ -36,26 +37,52 @@ export const TOP_30_RETAILER_ADAPTERS = [
   { domain: 'barnesandnoble.com', store_name: 'Barnes & Noble', title_selector: 'h1.pdp-header-title', price_selector: '#pdp-cur-price', image_selector: '#pdpMainImage', variant_selector: '.format-selected', client_only: 0 }
 ];
 
+/**
+ * Retailer adapters are configuration, not demo data: every install gets them.
+ * Counters start at zero — they are measurements, not marketing.
+ */
+export function seedRetailerAdapters(db) {
+  const nowIso = new Date().toISOString();
+  const insertAdapter = db.prepare(`
+    INSERT OR IGNORE INTO retailer_adapters (
+      domain, store_name, title_selector, price_selector, image_selector, variant_selector,
+      client_only, capture_attempts, capture_successes, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
+  `);
+  for (const a of TOP_30_RETAILER_ADAPTERS) {
+    insertAdapter.run(
+      a.domain, a.store_name, a.title_selector, a.price_selector, a.image_selector, a.variant_selector,
+      a.client_only, nowIso
+    );
+  }
+}
+
+/** Adapters plus the sample family. Used by demo mode and by the tests. */
 export function seedDatabase(db) {
+  seedRetailerAdapters(db);
+  seedDemoData(db);
+}
+
+/**
+ * The sample "Smith family". Only ever loaded in demo mode: it contains an
+ * admin account with a well-known id.
+ */
+export function seedDemoData(db) {
   const existingUsers = db.prepare('SELECT COUNT(*) as cnt FROM users').get().cnt;
   if (existingUsers > 0) return;
 
   const now = new Date();
   const nowIso = now.toISOString();
 
-  // 1. Seed Top 30 Retailer Adapters
-  const insertAdapter = db.prepare(`
-    INSERT OR IGNORE INTO retailer_adapters (
-      domain, store_name, title_selector, price_selector, image_selector, variant_selector,
-      client_only, capture_attempts, capture_successes, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  for (const a of TOP_30_RETAILER_ADAPTERS) {
-    insertAdapter.run(
-      a.domain, a.store_name, a.title_selector, a.price_selector, a.image_selector, a.variant_selector,
-      a.client_only, 14, 14, nowIso
-    );
-  }
+  // Occasions are placed relative to today so the sample data never goes stale.
+  const inDays = (n) => new Date(now.getTime() + n * 86400 * 1000).toISOString().slice(0, 10);
+  const monthDay = (iso) => [Number(iso.slice(5, 7)), Number(iso.slice(8, 10))];
+  const mayaDay = inDays(10);
+  const leoDay = inDays(16);
+  const justinDay = inDays(25);
+  const holidayDay = inDays(36);
+  const elenaDay = inDays(60);
+  const arthurDay = inDays(106);
 
   // 2. Seed Users (Adults + Under-13 Dependent Child Profile)
   const insertUser = db.prepare(`
@@ -66,15 +93,15 @@ export function seedDatabase(db) {
   `);
 
   // Justin Smith (Primary user & Admin)
-  insertUser.run('usr_justin', 'Justin Smith', 'justin@smithfamily.dev', null, 12, 14, 0, 1, nowIso);
+  insertUser.run('usr_justin', 'Justin Smith', 'justin@smith.example', null, ...monthDay(justinDay), 0, 1, nowIso);
   // Maya Smith (Partner / Co-owner & List Helper)
-  insertUser.run('usr_maya', 'Maya Smith', 'maya@smithfamily.dev', null, 11, 29, 0, 0, nowIso);
+  insertUser.run('usr_maya', 'Maya Smith', 'maya@smith.example', null, ...monthDay(mayaDay), 0, 0, nowIso);
   // Aunt Elena (Relative / Active Follower & Gift-Giver)
-  insertUser.run('usr_elena', 'Aunt Elena Vance', 'elena@vance.org', null, 1, 18, 0, 0, nowIso);
+  insertUser.run('usr_elena', 'Aunt Elena Vance', 'elena@vance.example', null, ...monthDay(elenaDay), 0, 0, nowIso);
   // Grandpa Arthur (Older relative persona)
-  insertUser.run('usr_arthur', 'Grandpa Arthur', 'arthur@smithfamily.dev', null, 3, 5, 0, 0, nowIso);
+  insertUser.run('usr_arthur', 'Grandpa Arthur', 'arthur@smith.example', null, ...monthDay(arthurDay), 0, 0, nowIso);
   // Leo Smith (Under-13 Dependent Child Profile — no email/login per D6!)
-  insertUser.run('usr_leo', 'Leo Smith (Age 8)', null, null, 12, 5, 1, 0, nowIso);
+  insertUser.run('usr_leo', 'Leo Smith', null, null, ...monthDay(leoDay), 1, 0, nowIso);
 
   // Guardian Links for Leo (Many-to-many: both Justin and Maya are guardians)
   const insertGuardian = db.prepare(`
@@ -87,7 +114,7 @@ export function seedDatabase(db) {
   // 3. Seed Family Group ("Smith Family Circle")
   db.prepare(`
     INSERT INTO groups (id, name, description, invite_code, created_by, created_at)
-    VALUES ('grp_smith', 'Smith Family Circle', 'Birthdays, holidays & kid wishlists — zero duplicate gifts, zero spoiled surprises.', 'SMITH-2026', 'usr_justin', ?)
+    VALUES ('grp_smith', 'Smith Family Circle', 'Birthdays, holidays and the kids — no duplicate gifts, no spoiled surprises.', 'SMITH-FAMILY', 'usr_justin', ?)
   `).run(nowIso);
 
   const insertMember = db.prepare('INSERT INTO group_members (group_id, user_id, role, joined_at) VALUES (?, ?, ?, ?)');
@@ -117,11 +144,11 @@ export function seedDatabase(db) {
     INSERT INTO occasions (id, user_id, kind, label, date, recurs, created_at)
     VALUES (?, ?, ?, ?, ?, 1, ?)
   `);
-  insertOccasion.run('occ_maya_bday', 'usr_maya', 'Birthday', "Maya's Birthday", '2026-11-29', nowIso);
-  insertOccasion.run('occ_leo_bday', 'usr_leo', 'Birthday', "Leo's 9th Birthday", '2026-12-05', nowIso);
-  insertOccasion.run('occ_justin_bday', 'usr_justin', 'Birthday', "Justin's Birthday", '2026-12-14', nowIso);
-  insertOccasion.run('occ_winter', 'usr_justin', 'Holiday', 'Winter Holidays', '2026-12-25', nowIso);
-  insertOccasion.run('occ_elena_bday', 'usr_elena', 'Birthday', "Aunt Elena's Birthday", '2027-01-18', nowIso);
+  insertOccasion.run('occ_maya_bday', 'usr_maya', 'Birthday', "Maya's birthday", mayaDay, nowIso);
+  insertOccasion.run('occ_leo_bday', 'usr_leo', 'Birthday', "Leo's 9th birthday", leoDay, nowIso);
+  insertOccasion.run('occ_justin_bday', 'usr_justin', 'Birthday', "Justin's birthday", justinDay, nowIso);
+  insertOccasion.run('occ_winter', 'usr_justin', 'Holiday', 'Winter holidays', holidayDay, nowIso);
+  insertOccasion.run('occ_elena_bday', 'usr_elena', 'Birthday', "Aunt Elena's birthday", elenaDay, nowIso);
 
   // 6. Seed Budgets (TRK-4)
   const insertBudget = db.prepare(`
@@ -143,26 +170,26 @@ export function seedDatabase(db) {
 
   // Justin's Personal List (Surprise mode ON by default - D1)
   insertList.run(
-    'lst_justin_holiday', 'usr_justin', '[]', "Justin's Birthday & Winter Wishlist",
-    'Birthday', '2026-12-14', null, 'link', 1, 'justin-winter-2026', nowIso
+    'lst_justin_holiday', 'usr_justin', '[]', "Justin's birthday & winter wishlist",
+    'Birthday', justinDay, null, 'link', 1, 'justin-winter-2026', nowIso
   );
 
   // Maya's Birthday List (Surprise mode ON)
   insertList.run(
-    'lst_maya_bday', 'usr_maya', '[]', "Maya's November Birthday & Cozy Reads",
-    'Birthday', '2026-11-29', null, 'link', 1, 'maya-birthday-2026', nowIso
+    'lst_maya_bday', 'usr_maya', '[]', "Maya's birthday & cozy reads",
+    'Birthday', mayaDay, null, 'link', 1, 'maya-birthday-2026', nowIso
   );
 
   // Leo's 9th Birthday List (Guardian-managed under-13 list)
   insertList.run(
-    'lst_leo_bday', 'usr_leo', '[]', "Leo's 9th Birthday (LEGO & Space)",
-    'Birthday', '2026-12-05', null, 'link', 1, 'leo-9th-bday', nowIso
+    'lst_leo_bday', 'usr_leo', '[]', "Leo's 9th birthday: LEGO & space",
+    'Birthday', leoDay, null, 'link', 1, 'leo-9th-bday', nowIso
   );
 
   // Aunt Elena's Holiday List
   insertList.run(
-    'lst_elena_holiday', 'usr_elena', '[]', "Elena's Kitchen & Garden Wishes",
-    'Holiday', '2026-12-25', null, 'link', 1, 'elena-holiday-2026', nowIso
+    'lst_elena_holiday', 'usr_elena', '[]', "Elena's kitchen & garden wishes",
+    'Holiday', holidayDay, null, 'link', 1, 'elena-holiday-2026', nowIso
   );
 
   // List Helpers (LST-4 / D9): Maya is helper on Justin's list; Justin is helper on Maya's list
@@ -223,7 +250,7 @@ export function seedDatabase(db) {
     null, null, 'Bookshop.org / Local Cafe', '/api/image-proxy?label=Bookstore+%26+Coffee+Fund&theme=rose', 25.00,
     'Any denomination', 1, 1, 0, 'normal',
     'Always appreciated year-round for weekend reads.', 1,
-    'Venmo @justin-smith-family or any local indie bookstore card (visible only to family group members)', hiConf, 4, nowIso, nowIso
+    'Venmo @justin-smith-example, or a gift card from any local indie bookstore', hiConf, 4, nowIso, nowIso
   );
 
   // Maya's Items
@@ -265,7 +292,7 @@ export function seedDatabase(db) {
     'https://www.lego.com/en-us/product/nasa-artemis-space-launch-system-10341',
     'LEGO', '/api/image-proxy?label=LEGO+NASA+Artemis+Rocket&theme=blue', 99.99,
     'Set #10341', 1, 0, 1, 'most_wanted',
-    'Leo has been talking about this rocket every day since October!', 0, null, hiConf, 1, nowIso, nowIso
+    'Leo has been talking about this rocket every day for weeks!', 0, null, hiConf, 1, nowIso, nowIso
   );
 
   insertItem.run(
@@ -310,7 +337,7 @@ export function seedDatabase(db) {
 
   insertClaim.run(
     'clm_justin_on_maya', 'itm_m2', 'lst_maya_bday', 'usr_justin',
-    'mng_demo_2', 1, 'purchased', futureExpiry, 'Etsy order #44519 — arriving Nov 24', nowIso, nowIso, nowIso
+    'mng_demo_2', 1, 'purchased', futureExpiry, 'Etsy order #44519 — arriving next week', nowIso, nowIso, nowIso
   );
 
   insertClaim.run(
@@ -344,7 +371,7 @@ export function seedDatabase(db) {
     'Framed Vintage Botanical Print from our Portland Trip',
     'https://www.etsy.com/listing/554433/vintage-pacific-northwest-fern-print',
     85.00,
-    'She mentioned loving the fern prints at the market in October — keep secret!',
+    'She mentioned loving the fern prints at the market — keep it secret!',
     'usr_elena',
     nowIso
   );
@@ -354,7 +381,7 @@ export function seedDatabase(db) {
     'Surprise Tickets to Symphony Sci-Fi Film Score Night',
     null,
     140.00,
-    'Dec 18 show — already checked his calendar.',
+    'Already checked his calendar for that weekend.',
     'usr_maya',
     nowIso
   );

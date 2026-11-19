@@ -1,7 +1,7 @@
 {
   "name": "hushlist",
   "version": "1.0.0",
-  "description": "Hushlist — Universal Wishlist with Zero Spoilers, Reliable Item Capture, and Frictionless Gifting",
+  "description": "Hushlist \u2014 wishlists for any store that keep the surprise",
   "type": "module",
   "scripts": {
     "start": "node src/server.mjs",
@@ -9,6 +9,7 @@
     "test": "node --test tests/*.test.mjs"
   },
   "engines": {
-    "node": ">=22.5.0"
-  }
+    "node": ">=22.13.0"
+  },
+  "private": true
 }

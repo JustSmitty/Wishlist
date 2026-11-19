@@ -1,0 +1,9 @@
+# Local database (created on first start)
+data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+node_modules/
+.DS_Store
+*.log
