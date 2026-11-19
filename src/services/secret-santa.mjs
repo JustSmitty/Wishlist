@@ -1,130 +1,147 @@
 /**
- * EXC-1: Secret Santa Draw within a Group with Exclusions
+ * Secret Santa draw within a group.
  *
- * Rules:
- * - Organizer does not see pairings by default.
- * - Draw is verifiable as complete without revealing pairs (via a SHA-256 verification hash of the sorted cycle/derangement).
- * - Each participant can query ONLY their own assigned recipient.
+ * - Only a group organizer can run a draw.
+ * - Participants are the group's active adult members.
+ * - Exclusions are unordered pairs who must not draw each other.
+ * - Each participant can read only their own recipient. Pairings are stored
+ *   server-side; anyone with direct database access can read them, so this is
+ *   privacy from the other participants, not a cryptographic guarantee.
  */
 
 import crypto from 'node:crypto';
-import { uid } from '../db/schema.mjs';
+import { uid, inTransaction } from '../db/schema.mjs';
+import { badRequest, forbidden, notFound, conflict } from '../errors.mjs';
+import { isGroupOrganizer } from './access.mjs';
+import { cleanText, cleanDate, cleanPrice } from './capture.mjs';
 
 export function createSecretSantaExchange(db, {
   groupId,
   name,
   eventDate,
   budgetLimit = 50,
-  exclusions = [], // Array of [userA, userB]
+  exclusions = [],
   createdBy
 }) {
+  const group = db.prepare('SELECT * FROM groups WHERE id = ?').get(String(groupId ?? ''));
+  if (!group) throw notFound('Circle not found');
+  if (!isGroupOrganizer(db, group.id, createdBy)) {
+    throw forbidden('Only an organizer of this circle can draw names');
+  }
+
+  const date = cleanDate(eventDate);
+  if (!date) throw badRequest('Pick a valid exchange date');
+  const budget = cleanPrice(budgetLimit, 100_000);
+  if (budget === null) throw badRequest('Enter a valid budget');
+  const cleanName = cleanText(name, 120) || 'Secret Santa';
+
   const members = db.prepare(`
-    SELECT u.id, u.name FROM group_members gm
+    SELECT u.id FROM group_members gm
     JOIN users u ON u.id = gm.user_id
-    WHERE gm.group_id = ? AND u.status = 'active'
-  `).all(groupId);
+    WHERE gm.group_id = ? AND u.status = 'active' AND u.is_dependent = 0
+    ORDER BY u.id
+  `).all(group.id).map(m => m.id);
 
   if (members.length < 3) {
-    throw new Error('At least 3 group members are required for a Secret Santa draw');
+    throw badRequest('A draw needs at least 3 people in the circle');
   }
 
-  const memberIds = members.map(m => m.id);
-  const forbidden = new Set();
+  if (!Array.isArray(exclusions) || exclusions.length > 200) throw badRequest('Too many exclusions');
+  const memberSet = new Set(members);
+  const forbiddenPairs = new Set();
+  const cleanExclusions = [];
   for (const pair of exclusions) {
-    if (Array.isArray(pair) && pair.length === 2) {
-      forbidden.add(`${pair[0]}->${pair[1]}`);
-      forbidden.add(`${pair[1]}->${pair[0]}`);
+    if (!Array.isArray(pair) || pair.length !== 2) throw badRequest('Each exclusion must name two people');
+    const [a, b] = pair;
+    if (!memberSet.has(a) || !memberSet.has(b) || a === b) {
+      throw badRequest('Exclusions must name two different people in this circle');
     }
+    forbiddenPairs.add(`${a}>${b}`);
+    forbiddenPairs.add(`${b}>${a}`);
+    cleanExclusions.push([a, b]);
   }
 
-  const assignment = findValidDerangement(memberIds, forbidden);
+  // Prefer a draw with no "A gives to B and B gives to A" pairs. If the
+  // exclusions make that impossible, a valid draw with mutual pairs is still
+  // better than refusing a solvable request.
+  const assignment = findAssignment(members, forbiddenPairs, true) || findAssignment(members, forbiddenPairs, false);
   if (!assignment) {
-    throw new Error('No valid Secret Santa pairing exists with the selected exclusions');
+    throw conflict('Those exclusions leave no valid draw. Remove one and try again.');
   }
 
   const exchangeId = uid('ss');
   const nowIso = new Date().toISOString();
 
-  // Compute verifiable completeness hash without revealing individual pairings
-  const salt = crypto.randomBytes(16).toString('hex');
-  const summaryPayload = Object.entries(assignment)
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([g, r]) => `${g}:${r}`)
-    .join('|');
-  const verificationHash = crypto.createHash('sha256').update(`${salt}|${summaryPayload}`).digest('hex');
-
-  db.exec('BEGIN IMMEDIATE');
-  try {
+  inTransaction(db, () => {
     db.prepare(`
       INSERT INTO secret_santa_exchanges (
         id, group_id, name, event_date, budget_limit, exclusions, verification_hash, created_by, created_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
-      exchangeId,
-      groupId,
-      name,
-      eventDate,
-      Number(budgetLimit) || 50,
-      JSON.stringify(exclusions),
-      verificationHash,
-      createdBy,
-      nowIso
+      exchangeId, group.id, cleanName, date, budget, JSON.stringify(cleanExclusions),
+      // Legacy NOT NULL column. It was presented as a verifiable commitment,
+      // but its salt was discarded so nothing could ever be checked against it.
+      crypto.randomBytes(16).toString('hex'),
+      createdBy, nowIso
     );
-
-    const insertPairing = db.prepare(`
-      INSERT INTO secret_santa_pairings (exchange_id, giver_user_id, recipient_user_id)
-      VALUES (?, ?, ?)
-    `);
-
-    for (const [giverId, recipientId] of Object.entries(assignment)) {
-      insertPairing.run(exchangeId, giverId, recipientId);
-    }
-
-    db.exec('COMMIT');
-  } catch (err) {
-    try { db.exec('ROLLBACK'); } catch {}
-    throw err;
-  }
+    const insertPairing = db.prepare(
+      'INSERT INTO secret_santa_pairings (exchange_id, giver_user_id, recipient_user_id) VALUES (?, ?, ?)'
+    );
+    for (const [giverId, recipientId] of assignment) insertPairing.run(exchangeId, giverId, recipientId);
+  });
 
   return {
     id: exchangeId,
-    group_id: groupId,
-    name,
-    event_date: eventDate,
-    budget_limit: budgetLimit,
-    participant_count: memberIds.length,
-    all_assigned_verified: true,
-    verification_hash: verificationHash,
+    group_id: group.id,
+    name: cleanName,
+    event_date: date,
+    budget_limit: budget,
+    participant_count: members.length,
     created_at: nowIso
   };
 }
 
-function findValidDerangement(memberIds, forbiddenSet) {
-  const n = memberIds.length;
-  // Backtracking with randomized recipient order
-  const used = new Set();
-  const result = {};
+/** Unbiased Fisher–Yates shuffle driven by the OS CSPRNG. */
+function shuffled(items) {
+  const out = [...items];
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = crypto.randomInt(0, i + 1);
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+}
 
-  function backtrack(idx) {
-    if (idx === n) return true;
-    const giver = memberIds[idx];
-    const candidates = [...memberIds].sort(() => Math.random() - 0.5);
-    for (const rec of candidates) {
-      if (rec === giver) continue;
-      if (used.has(rec)) continue;
-      if (forbiddenSet.has(`${giver}->${rec}`)) continue;
-      // Avoid 2-person mutual cycles when n > 2
-      if (n > 2 && result[rec] === giver) continue;
+/**
+ * Randomised backtracking search for a derangement that respects the forbidden
+ * pairs. Complete: if any valid assignment exists under the given rules it is
+ * found (within a generous step budget). Givers with the fewest options are
+ * placed first to keep it fast.
+ */
+function findAssignment(memberIds, forbiddenPairs, avoidMutual) {
+  const options = new Map(memberIds.map(g => [
+    g, memberIds.filter(r => r !== g && !forbiddenPairs.has(`${g}>${r}`))
+  ]));
+  const order = shuffled(memberIds).sort((a, b) => options.get(a).length - options.get(b).length);
+  const taken = new Set();
+  const result = new Map();
+  let steps = 0;
 
-      used.add(rec);
-      result[giver] = rec;
-      if (backtrack(idx + 1)) return true;
-      used.delete(rec);
-      delete result[giver];
+  function place(idx) {
+    if (idx === order.length) return true;
+    // Bound the work so a hostile set of exclusions cannot stall the server.
+    if (++steps > 250_000) return false;
+    const giver = order[idx];
+    for (const rec of shuffled(options.get(giver))) {
+      if (taken.has(rec)) continue;
+      if (avoidMutual && result.get(rec) === giver) continue;
+      taken.add(rec);
+      result.set(giver, rec);
+      if (place(idx + 1)) return true;
+      taken.delete(rec);
+      result.delete(giver);
     }
     return false;
   }
 
-  if (backtrack(0)) return result;
-  return null;
+  return place(0) ? result : null;
 }

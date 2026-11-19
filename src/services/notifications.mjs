@@ -1,23 +1,29 @@
 /**
- * Section 16 & NTF-1..3: Spoiler-Checked Notification Engine
+ * Notification outbox.
  *
- * HARD INVARIANT:
- * Every notification is checked against one rule: NOTHING sent to a list owner
- * (or co-owner) may reveal whether an item on their own list is claimed while
- * surprise_mode is on.
+ * Invariant: nothing addressed to the owner or a co-owner of an unrevealed
+ * surprise-mode list may reveal whether an item on that list is claimed.
+ *
+ * Delivery: this build has no email provider. Rows are written to
+ * notifications_outbox and handed to an optional transport. In demo mode the
+ * outbox is shown in the app; otherwise the default transport prints to the
+ * server log. Wire a real provider in with setMailTransport().
  */
 
 import { uid } from '../db/schema.mjs';
-import { safeJsonParse } from './surprise.mjs';
+import { getViewerRole, safeJsonParse } from './surprise.mjs';
 
 const TRANSACTIONAL_EVENTS = new Set([
+  'sign_in_code',
   'guest_verification_code',
   'claimed_item_changed',
   'claimed_item_withdrawn',
   'claim_expiring',
-  'did_you_buy_it'
+  'did_you_buy_it',
+  'list_revealed'
 ]);
 
+// Events that exist only because a claim exists.
 const SPOILER_EVENT_TYPES = new Set([
   'claimed_item_changed',
   'claimed_item_withdrawn',
@@ -25,8 +31,20 @@ const SPOILER_EVENT_TYPES = new Set([
   'did_you_buy_it',
   'claimed_item_price_drop',
   'claimed_item_out_of_stock',
-  'claim_confirmed'
+  'claim_confirmed',
+  'list_revealed'
 ]);
+
+let mailTransport = null;
+
+/** fn({ to, subject, body, eventType }) — called once per message that is due now. */
+export function setMailTransport(fn) {
+  mailTransport = typeof fn === 'function' ? fn : null;
+}
+
+export function consoleMailTransport({ to, subject, body }) {
+  console.log(`[mail:console] to=${to}\n  subject: ${subject}\n  ${String(body).replace(/\n/g, '\n  ')}`);
+}
 
 export function sendNotification(db, {
   recipientUserId = null,
@@ -38,33 +56,32 @@ export function sendNotification(db, {
   channel = 'email'
 }) {
   if (!recipientEmail && recipientUserId) {
-    const u = db.prepare('SELECT email FROM users WHERE id = ?').get(recipientUserId);
+    const u = db.prepare("SELECT email FROM users WHERE id = ? AND status = 'active'").get(recipientUserId);
     if (u) recipientEmail = u.email;
   }
   if (!recipientEmail) return { skipped: true, reason: 'no_email' };
 
-  // CRITICAL SPOILER CHECK (Section 16):
-  // Verify recipient is NOT the owner or co-owner of a surprise-mode list for any claim/spoiler notification
-  if (listId) {
+  if (listId && SPOILER_EVENT_TYPES.has(eventType)) {
     const list = db.prepare('SELECT * FROM lists WHERE id = ?').get(listId);
     if (list && list.surprise_mode === 1 && !list.revealed_at) {
-      const coOwners = safeJsonParse(list.co_owner_ids, []);
-      const ownerUser = db.prepare('SELECT email FROM users WHERE id = ?').get(list.owner_id);
+      const ownerIds = [list.owner_id, ...safeJsonParse(list.co_owner_ids, [])];
+      const ownerEmails = ownerIds
+        .map(id => db.prepare('SELECT email FROM users WHERE id = ?').get(id)?.email)
+        .filter(Boolean)
+        .map(e => e.toLowerCase());
       const isRecipientOwner =
-        (recipientUserId && (recipientUserId === list.owner_id || coOwners.includes(recipientUserId))) ||
-        (ownerUser && ownerUser.email && ownerUser.email.toLowerCase() === recipientEmail.toLowerCase());
-
-      if (isRecipientOwner && SPOILER_EVENT_TYPES.has(eventType)) {
-        // Record spoiler block & refuse to send
+        (recipientUserId && ownerIds.includes(recipientUserId)) ||
+        ownerEmails.includes(String(recipientEmail).toLowerCase());
+      if (isRecipientOwner) {
         return { skipped: true, reason: 'spoiler_protection_blocked_owner_notification' };
       }
     }
   }
 
   const isTransactional = TRANSACTIONAL_EVENTS.has(eventType);
+  const now = new Date();
+  let scheduledFor = now;
 
-  // Check NTF-3 preferences for non-transactional messages
-  let scheduledFor = new Date().toISOString();
   if (recipientUserId && !isTransactional) {
     const pref = db.prepare(
       'SELECT * FROM notification_preferences WHERE user_id = ? AND event_type = ? AND channel = ?'
@@ -74,24 +91,24 @@ export function sendNotification(db, {
       return { skipped: true, reason: 'disabled_by_user_preference' };
     }
 
-    // Quiet hours check (9 PM to 8 AM local by default, NTF-3)
+    // Quiet hours are evaluated in the recipient's time zone, not the server's.
     const quietStart = pref ? pref.quiet_hours_start : 21;
     const quietEnd = pref ? pref.quiet_hours_end : 8;
-    const now = new Date();
-    const hour = now.getHours();
-    if (hour >= quietStart || hour < quietEnd) {
-      const nextMorning = new Date(now);
-      if (hour >= quietStart) {
-        nextMorning.setDate(nextMorning.getDate() + 1);
-      }
-      nextMorning.setHours(quietEnd, 0, 0, 0);
-      scheduledFor = nextMorning.toISOString();
+    const hour = hourInZone(now, pref?.time_zone);
+    const inQuietHours = quietStart > quietEnd
+      ? (hour >= quietStart || hour < quietEnd)
+      : (hour >= quietStart && hour < quietEnd);
+    if (inQuietHours) {
+      const hoursUntilEnd = (quietEnd - hour + 24) % 24 || 24;
+      scheduledFor = new Date(now.getTime() + hoursUntilEnd * 3600 * 1000);
+      scheduledFor.setUTCMinutes(0, 0, 0);
     }
   }
 
   const id = uid('ntf');
   const unsubToken = isTransactional ? null : uid('unsub');
-  const nowStr = new Date().toISOString();
+  const nowIso = now.toISOString();
+  const dueNow = scheduledFor.getTime() <= now.getTime();
 
   db.prepare(`
     INSERT INTO notifications_outbox (
@@ -108,47 +125,62 @@ export function sendNotification(db, {
     channel,
     isTransactional ? 1 : 0,
     unsubToken,
-    scheduledFor,
-    nowStr,
-    nowStr
+    scheduledFor.toISOString(),
+    dueNow ? nowIso : null,
+    nowIso
   );
 
-  return { id, sent: true, transactional: isTransactional, scheduled_for: scheduledFor, unsubscribe_token: unsubToken };
+  if (dueNow && mailTransport) {
+    try {
+      mailTransport({ to: recipientEmail, subject, body, eventType });
+    } catch (err) {
+      console.error('[mail] transport failed:', err.message);
+    }
+  }
+
+  return { id, sent: dueNow, transactional: isTransactional, scheduled_for: scheduledFor.toISOString() };
+}
+
+function hourInZone(date, timeZone) {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      hour: 'numeric', hourCycle: 'h23', timeZone: timeZone || undefined
+    }).formatToParts(date);
+    return Number(parts.find(p => p.type === 'hour').value);
+  } catch {
+    return date.getHours();
+  }
 }
 
 /**
- * NTF-1 & Section 16: Follower Digest Generator
- * Compiles changes to followed lists (new items, removed items, price drops, priority changes)
- * while strictly enforcing the Section 16 Spoiler Rule:
- * "Digest never includes claims on the reader's own lists" and "At most one digest per user per day".
+ * Follower digest: recent changes on lists the reader follows. At most one per
+ * UTC day. Never includes the reader's own lists, and never includes a list
+ * the reader could not open right now (private, blocked, share removed).
  */
 export function generateFollowerDigest(db, { followerUserId }) {
   const follower = db.prepare("SELECT * FROM users WHERE id = ? AND status = 'active'").get(followerUserId);
   if (!follower || !follower.email) {
-    throw new Error('Active user with email is required for follower digest');
+    return { already_sent_today: false, events_included: 0, notification: { skipped: true, reason: 'no_email' } };
   }
 
-  // Enforce at most one digest per user per day (Section 16 rule)
   const todayPrefix = new Date().toISOString().slice(0, 10);
   const existingToday = db.prepare(`
-    SELECT * FROM notifications_outbox
+    SELECT id FROM notifications_outbox
     WHERE recipient_user_id = ? AND event_type = 'follower_digest' AND created_at LIKE ?
     LIMIT 1
   `).get(follower.id, `${todayPrefix}%`);
 
   if (existingToday) {
-    return { already_sent_today: true, notification: existingToday };
+    return { already_sent_today: true };
   }
 
-  // Gather non-spoiler events on followed people's lists (NEVER on the follower's own or co-owned lists!)
-  const recentEvents = db.prepare(`
-    SELECT e.*, l.name AS list_name, l.owner_id, u.name AS owner_name
+  const candidates = db.prepare(`
+    SELECT e.*, l.name AS list_name, u.name AS owner_name
     FROM events e
     JOIN lists l ON l.id = e.list_id
     JOIN users u ON u.id = l.owner_id
     WHERE e.is_spoiler = 0
       AND l.owner_id != ?
-      AND l.co_owner_ids NOT LIKE ?
       AND (
         l.owner_id IN (SELECT target_id FROM follows WHERE follower_id = ? AND target_type = 'user' AND status = 'approved')
         OR l.id IN (SELECT target_id FROM follows WHERE follower_id = ? AND target_type = 'list' AND status = 'approved')
@@ -157,31 +189,45 @@ export function generateFollowerDigest(db, { followerUserId }) {
           JOIN group_members gm2 ON gm1.group_id = gm2.group_id
           WHERE gm1.user_id = ?
         )
+        OR l.owner_id IN (SELECT dependent_id FROM guardian_links WHERE guardian_id = ?)
       )
     ORDER BY e.at DESC
-    LIMIT 25
-  `).all(follower.id, `%"${follower.id}"%`, follower.id, follower.id, follower.id);
+    LIMIT 200
+  `).all(follower.id, follower.id, follower.id, follower.id, follower.id);
+
+  const listCache = new Map();
+  const recentEvents = [];
+  for (const ev of candidates) {
+    if (!listCache.has(ev.list_id)) {
+      const list = db.prepare('SELECT * FROM lists WHERE id = ?').get(ev.list_id);
+      const ctx = getViewerRole(db, list, follower.id);
+      // An owner/co-owner never gets their own list in a digest.
+      listCache.set(ev.list_id, Boolean(ctx.canView) && ctx.role !== 'owner');
+    }
+    if (listCache.get(ev.list_id)) recentEvents.push(ev);
+    if (recentEvents.length >= 25) break;
+  }
 
   const lines = recentEvents.map(ev => {
     const details = safeJsonParse(ev.details, {});
     if (ev.action === 'price_drop') {
-      return `• Price Drop (${details.drop_percent}% off) on ${ev.owner_name}'s list "${ev.list_name}": ${details.title} ($${details.old_price} -> $${details.new_price})`;
+      return `• Price drop (${details.drop_percent}% off) on ${ev.owner_name}'s list "${ev.list_name}": ${details.title} ($${details.old_price} → $${details.new_price})`;
     }
     if (ev.action === 'back_in_stock') {
-      return `• Back in Stock on ${ev.owner_name}'s list "${ev.list_name}": ${details.title}`;
+      return `• Back in stock on ${ev.owner_name}'s list "${ev.list_name}": ${details.title}`;
     }
-    return `• New update on ${ev.owner_name}'s list "${ev.list_name}": ${details.title || ev.action}`;
+    return `• New on ${ev.owner_name}'s list "${ev.list_name}": ${details.title || ev.action}`;
   });
 
   if (lines.length === 0) {
-    lines.push('• All followed wishlists are up to date — check your upcoming occasion countdowns in Hushlist.');
+    lines.push('• Nothing new on the lists you follow.');
   }
 
   const sent = sendNotification(db, {
     recipientUserId: follower.id,
     recipientEmail: follower.email,
     eventType: 'follower_digest',
-    subject: `Your Hushlist Daily Digest (${recentEvents.length} wishlist update${recentEvents.length === 1 ? '' : 's'})`,
+    subject: `Your Hushlist digest (${recentEvents.length} update${recentEvents.length === 1 ? '' : 's'})`,
     body: `Updates for the people you shop for:\n${lines.join('\n')}`
   });
 

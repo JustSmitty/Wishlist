@@ -13,6 +13,7 @@ export function createDatabase(dbPath = process.env.HUSHLIST_DB || path.join(pro
   const db = new DatabaseSync(dbPath);
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec('PRAGMA foreign_keys = ON;');
+  db.exec('PRAGMA busy_timeout = 5000;');
   initSchema(db);
   runMigrations(db);
   return db;
@@ -26,6 +27,24 @@ function runMigrations(db) {
   if (!claimCols.has('expiry_warned')) {
     db.exec('ALTER TABLE claims ADD COLUMN expiry_warned INTEGER NOT NULL DEFAULT 0;');
   }
+
+  // Lookups that every list / dashboard request performs. Without these each
+  // one is a full table scan.
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_lists_owner ON lists(owner_id);
+    CREATE INDEX IF NOT EXISTS idx_items_list ON items(list_id, status);
+    CREATE INDEX IF NOT EXISTS idx_claims_item ON claims(item_id, status);
+    CREATE INDEX IF NOT EXISTS idx_claims_list ON claims(list_id);
+    CREATE INDEX IF NOT EXISTS idx_claims_claimer ON claims(claimer_user_id);
+    CREATE INDEX IF NOT EXISTS idx_claim_events_claim ON claim_events(claim_id);
+    CREATE INDEX IF NOT EXISTS idx_contributions_item ON contributions(item_id, status);
+    CREATE INDEX IF NOT EXISTS idx_price_snapshots_item ON price_snapshots(item_id, checked_at);
+    CREATE INDEX IF NOT EXISTS idx_follows_target ON follows(target_type, target_id);
+    CREATE INDEX IF NOT EXISTS idx_secret_ideas_subject ON secret_ideas(subject_user_id);
+    CREATE INDEX IF NOT EXISTS idx_outbox_recipient ON notifications_outbox(recipient_user_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_events_list ON events(list_id, at);
+    CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+  `);
 }
 
 export function initSchema(db) {
@@ -377,10 +396,84 @@ export function initSchema(db) {
       properties TEXT NOT NULL DEFAULT '{}',
       created_at TEXT NOT NULL
     );
+
+    -- 22. Sessions. Only the SHA-256 of the bearer token is stored, so a copy
+    --     of the database does not let anyone sign in. kind = 'web' (cookie)
+    --     or 'api' (browser-extension token).
+    CREATE TABLE IF NOT EXISTS sessions (
+      token_hash TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      kind TEXT NOT NULL DEFAULT 'web',
+      label TEXT,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+
+    -- 23. Passwordless sign-in challenges (6-digit code sent to the email).
+    CREATE TABLE IF NOT EXISTS auth_challenges (
+      id TEXT PRIMARY KEY,
+      email TEXT NOT NULL,
+      code_hash TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      verified_at TEXT,
+      consumed_at TEXT,
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
   `);
 }
 
+/** Row identifier. Not a secret: never use one as proof of anything. */
 export function uid(prefix = '') {
   const raw = crypto.randomBytes(8).toString('hex');
   return prefix ? `${prefix}_${raw}` : raw;
+}
+
+/**
+ * Bearer secret (share links, claim manage links, sessions, invite codes).
+ * 192 bits from the OS CSPRNG, URL-safe.
+ */
+export function secretToken(prefix = '') {
+  const raw = crypto.randomBytes(24).toString('base64url');
+  return prefix ? `${prefix}_${raw}` : raw;
+}
+
+/** Uniform 6-digit code from the CSPRNG (Math.random is not acceptable here). */
+export function sixDigitCode() {
+  return String(crypto.randomInt(0, 1_000_000)).padStart(6, '0');
+}
+
+export function sha256(value) {
+  return crypto.createHash('sha256').update(String(value)).digest('hex');
+}
+
+/** Constant-time string comparison for secrets. */
+export function safeEqual(a, b) {
+  const x = Buffer.from(String(a ?? ''));
+  const y = Buffer.from(String(b ?? ''));
+  return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+
+const openTransactions = new WeakSet();
+
+/**
+ * Runs fn inside BEGIN IMMEDIATE … COMMIT, rolling back on any throw.
+ * Re-entrant: a call made while a transaction is already open on this
+ * connection joins it instead of issuing a second BEGIN (which SQLite rejects).
+ */
+export function inTransaction(db, fn) {
+  if (openTransactions.has(db)) return fn();
+  db.exec('BEGIN IMMEDIATE');
+  openTransactions.add(db);
+  try {
+    const result = fn();
+    db.exec('COMMIT');
+    return result;
+  } catch (err) {
+    try { db.exec('ROLLBACK'); } catch { /* nothing to roll back */ }
+    throw err;
+  } finally {
+    openTransactions.delete(db);
+  }
 }

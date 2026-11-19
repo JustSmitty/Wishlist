@@ -1,62 +1,79 @@
 /**
- * Section 6 (GVR-1..8, EVT-1..2) & Section 14: Claim Lifecycle, Concurrency & Edge Cases Engine
+ * Claim lifecycle.
  *
- * Implements:
- * - GVR-1: Reserve with or without an account; email required for guests; magic-link token to manage claim.
- * - GVR-2: Claim states: reserved -> purchased -> given, or released / expired / withdrawn; claim expiry.
- * - GVR-3: "Did you buy it?" prompt after click-out to retailer.
- * - GVR-4: Partial quantities and group contributions ("chip in") toward one item.
- * - GVR-6: Guest claim controls: holds only after 6-digit email verification; max 3 open guest claims per guest per list; unverified claims lapse after 30 minutes.
- * - GVR-7: Claimer chooses whether other givers see their name.
- * - GVR-8: Simultaneous claims on the last unit resolve in an IMMEDIATE SQLite transaction to exactly 1 winner; never over-claimed.
- * - Section 14 Edge Cases:
- *   1. Owner deletes reserved item -> claim moves to 'withdrawn'; claimer notified "no longer wanted, no need to buy"; owner sees ordinary delete.
- *   2. Owner deletes purchased item -> item hidden; claim kept as 'purchased' for claimer's records; claimer notified "already bought? keep it as a gift or return it"; owner sees ordinary delete.
- *   3. Owner marks "Got it" -> treated as delete with reason "got_it"; claimers notified as above; owner sees ordinary "got it" confirmation.
- *   4. Owner edits size, color or notes after a claim -> claim kept; claimer gets old & new values side by side; owner sees ordinary edit.
- *   5. Owner lowers quantity below claimed units -> newest unpurchased claims released first; purchased claims kept; affected claimers notified; owner sees ordinary edit.
- *   6. Item sells out / price drops -> claim kept; claimer notified; owner sees nothing regarding claims.
- *   7. List archived with open claims -> reserved claims released; purchased claims kept in history; affected claimers notified.
- *   8. Gift bought outside the app arrives (EVT-1) -> owner marks received; matching item leaves active list; matching claimers notified.
- *   9. Guest never verifies email -> claim lapses after 30 minutes.
- *  10. Giver deletes account -> claims anonymized, state kept so purchase state stays accurate.
+ *   pending_verification ──code──▶ reserved ──▶ purchased ──▶ given
+ *            │                        │             │
+ *            └── 30 min ──▶ expired   └──▶ released ◀┘        (owner removes item ▶ withdrawn)
+ *
+ * Rules enforced here:
+ * - An item is never over-claimed: verified active quantity ≤ quantity wanted.
+ * - Guests hold nothing until they prove the email address with a 6-digit code;
+ *   five wrong codes cancel the claim; unverified claims lapse after 30 minutes.
+ * - Released, expired and withdrawn are final.
+ * - Only the person who made a claim can advance it. Helpers, guardians and
+ *   admins can release someone else's claim and nothing more.
+ * - Whatever an owner does to a claimed item, the owner's response is the same
+ *   as it would be for an unclaimed one.
  */
 
-import { uid } from '../db/schema.mjs';
+import { uid, secretToken, sixDigitCode, safeEqual, inTransaction } from '../db/schema.mjs';
+import { AppError, badRequest, forbidden, notFound, conflict } from '../errors.mjs';
 import { sendNotification } from './notifications.mjs';
-import { getViewerRole, safeJsonParse } from './surprise.mjs';
+import { getViewerRole, ownerCanSeeClaims, safeJsonParse } from './surprise.mjs';
+import { isGuardianOf } from './access.mjs';
+import { cleanText, cleanPrice, cleanInt, canonicalizeUrl } from './capture.mjs';
+
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const MAX_VERIFY_ATTEMPTS = 5;
+const PRIORITIES = ['most_wanted', 'high', 'normal', 'low'];
 
 /**
- * ADV-3.2: Canonicalizes guest email addresses for per-list claim cap counting
- * so Gmail +tags and dot variations (e.g. p.r.a.n.k+1@gmail.com) cannot bypass the 3-claim cap.
+ * Canonical form of a guest address for the per-list cap, so plus-tags and
+ * Gmail dot variants count as one person.
  */
 export function normalizeEmailForCap(email) {
   if (!email) return '';
   const cleaned = String(email).trim().toLowerCase();
-  const [local, domain] = cleaned.split('@');
-  if (!domain) return cleaned;
-  let baseLocal = local.split('+')[0];
-  if (domain === 'gmail.com' || domain === 'googlemail.com') {
-    baseLocal = baseLocal.replace(/\./g, '');
-  }
-  return `${baseLocal}@${domain === 'googlemail.com' ? 'gmail.com' : domain}`;
+  const at = cleaned.lastIndexOf('@');
+  if (at < 1) return cleaned;
+  let local = cleaned.slice(0, at).split('+')[0];
+  let domain = cleaned.slice(at + 1);
+  if (domain === 'googlemail.com') domain = 'gmail.com';
+  if (domain === 'gmail.com') local = local.replace(/\./g, '');
+  return `${local}@${domain}`;
+}
+
+/** What a claimer may be told about their own claim. Never includes secrets. */
+export function publicClaim(c) {
+  if (!c) return null;
+  return {
+    id: c.id,
+    item_id: c.item_id,
+    list_id: c.list_id,
+    status: c.status,
+    verified: Boolean(c.verified),
+    qty: c.qty,
+    show_name_to_givers: Boolean(c.show_name_to_givers),
+    expires_at: c.expires_at,
+    order_note: c.order_note,
+    clicked_out_at: c.clicked_out_at,
+    return_prompt_answered: c.return_prompt_answered,
+    updated_at: c.updated_at
+  };
 }
 
 export function purgeExpiredClaims(db, nowIso = new Date().toISOString()) {
   const nowMs = new Date(nowIso).getTime();
 
-  // 1. Lapse unverified guest claims older than 30 minutes (GVR-6, Section 14)
   const lapsedGuests = db.prepare(`
-    SELECT * FROM claims
+    SELECT id FROM claims
     WHERE verified = 0 AND status = 'pending_verification' AND verification_expires_at <= ?
   `).all(nowIso);
-
   for (const c of lapsedGuests) {
-    db.prepare("UPDATE claims SET status = 'expired', updated_at = ? WHERE id = ?").run(nowIso, c.id);
-    recordClaimEvent(db, c.id, 'pending_verification', 'expired', 'expiry', null, 'Guest did not verify email within 30 minutes', nowIso);
+    db.prepare("UPDATE claims SET status = 'expired', verification_code = NULL, updated_at = ? WHERE id = ?").run(nowIso, c.id);
+    recordClaimEvent(db, c.id, 'pending_verification', 'expired', 'expiry', null, 'Email not verified within 30 minutes', nowIso);
   }
 
-  // 2. Send 48-hour advance expiry warning for unconfirmed 'reserved' claims (GVR-2 & GAP-5.4)
   const warnHorizonIso = new Date(nowMs + 48 * 3600 * 1000).toISOString();
   const dueForWarning = db.prepare(`
     SELECT c.*, i.title AS item_title FROM claims c
@@ -64,7 +81,6 @@ export function purgeExpiredClaims(db, nowIso = new Date().toISOString()) {
     WHERE c.status = 'reserved' AND c.verified = 1 AND c.expiry_warned = 0
       AND c.expires_at IS NOT NULL AND c.expires_at > ? AND c.expires_at <= ?
   `).all(nowIso, warnHorizonIso);
-
   for (const c of dueForWarning) {
     db.prepare('UPDATE claims SET expiry_warned = 1, updated_at = ? WHERE id = ?').run(nowIso, c.id);
     sendNotification(db, {
@@ -72,35 +88,45 @@ export function purgeExpiredClaims(db, nowIso = new Date().toISOString()) {
       recipientEmail: c.guest_email,
       eventType: 'claim_expiring',
       listId: c.list_id,
-      subject: `Reminder: Your reservation for "${c.item_title}" expires in 48 hours`,
-      body: `Please confirm whether you purchased "${c.item_title}" or release the reservation so another gift-giver can get it.`
+      subject: `Your hold on "${c.item_title}" ends in 48 hours`,
+      body: `Mark "${c.item_title}" as bought, or release it so someone else can give it.`
     });
   }
 
-  // 3. Auto-release unconfirmed 'reserved' claims past expires_at (GVR-2)
   const expiredReserved = db.prepare(`
     SELECT c.*, i.title AS item_title FROM claims c
     JOIN items i ON i.id = c.item_id
     WHERE c.status = 'reserved' AND c.verified = 1 AND c.expires_at IS NOT NULL AND c.expires_at <= ?
   `).all(nowIso);
-
   for (const c of expiredReserved) {
     db.prepare("UPDATE claims SET status = 'expired', updated_at = ? WHERE id = ?").run(nowIso, c.id);
-    recordClaimEvent(db, c.id, 'reserved', 'expired', 'expiry', null, 'Reservation expired without purchase confirmation', nowIso);
+    recordClaimEvent(db, c.id, 'reserved', 'expired', 'expiry', null, 'Hold ended without a purchase being confirmed', nowIso);
     sendNotification(db, {
       recipientUserId: c.claimer_user_id,
       recipientEmail: c.guest_email,
       eventType: 'claim_expiring',
       listId: c.list_id,
-      subject: `Reservation expired: ${c.item_title}`,
-      body: `Your reservation for "${c.item_title}" expired and was auto-released so others can gift it.`
+      subject: `Your hold on "${c.item_title}" has ended`,
+      body: `Your hold on "${c.item_title}" ran out and the item is available to others again.`
     });
   }
 }
 
+function activeQuantity(db, itemId) {
+  return db.prepare(`
+    SELECT COALESCE(SUM(qty), 0) AS total
+    FROM claims
+    WHERE item_id = ? AND verified = 1 AND status IN ('reserved', 'purchased', 'given')
+  `).get(itemId).total;
+}
+
 /**
- * Creates a reservation atomically (GVR-1, GVR-6, GVR-8).
- * Uses `BEGIN IMMEDIATE` transaction so simultaneous claims on the last unit serialize and resolve to 1 winner.
+ * Reserve an item. Runs in one IMMEDIATE transaction so the availability
+ * check and the insert cannot be separated by another writer.
+ *
+ * Returns the public claim plus, for guests, `verification_code`. The caller
+ * decides whether that code may be shown (demo mode) — it must never be
+ * returned to a browser otherwise.
  */
 export function createClaim(db, {
   itemId,
@@ -109,102 +135,90 @@ export function createClaim(db, {
   guestName = null,
   qty = 1,
   showNameToGivers = true,
-  orderNote = null,
-  autoVerifyGuest = false // Used only if verification code is supplied inline
+  orderNote = null
 }) {
-  const requestedQty = Math.max(1, Number(qty) || 1);
+  const requestedQty = Number(qty ?? 1);
+  if (!Number.isInteger(requestedQty) || requestedQty < 1 || requestedQty > 99) {
+    throw badRequest('Quantity must be a whole number between 1 and 99');
+  }
+  const isGuest = !claimerUserId;
+  const email = isGuest ? String(guestEmail ?? '').trim().toLowerCase() : null;
+  if (isGuest && (email.length > 254 || !EMAIL_RE.test(email))) {
+    throw badRequest('A valid email address is required to reserve as a guest');
+  }
 
-  db.exec('BEGIN IMMEDIATE');
-  try {
+  return inTransaction(db, () => {
     const now = new Date();
     const nowIso = now.toISOString();
     purgeExpiredClaims(db, nowIso);
 
-    const item = db.prepare("SELECT * FROM items WHERE id = ? AND status = 'active'").get(itemId);
-    if (!item) {
-      throw new Error('Item is no longer available for claiming');
-    }
+    const item = db.prepare("SELECT * FROM items WHERE id = ? AND status = 'active'").get(String(itemId ?? ''));
+    if (!item) throw notFound('That item is no longer on the list');
 
     const list = db.prepare('SELECT * FROM lists WHERE id = ?').get(item.list_id);
-    if (!list || list.archived_at) {
-      throw new Error('List is archived or unavailable');
-    }
+    if (!list || list.archived_at) throw conflict('This list is closed');
 
-    // Prevent list owner from claiming on their own list (owners use "Got it" instead)
     const coOwners = safeJsonParse(list.co_owner_ids, []);
     if (claimerUserId && (claimerUserId === list.owner_id || coOwners.includes(claimerUserId))) {
-      throw new Error('List owners cannot reserve items on their own list');
+      throw forbidden('You cannot reserve items on your own list');
     }
 
-    // ADV-2.5: Enforce row-level list visibility check before permitting a claim
     const viewerCtx = getViewerRole(db, list, claimerUserId);
-    if (!viewerCtx.canView) {
-      throw new Error('Unauthorized to view or reserve items on this private list');
-    }
+    if (!viewerCtx.canView) throw forbidden('You do not have access to this list');
 
-    const isGuest = !claimerUserId;
-    if (isGuest && (!guestEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(guestEmail))) {
-      throw new Error('A valid email address is required for guest reservations');
-    }
-
-    // GVR-6 & ADV-3.2: Max 3 open guest claims per normalized guest email per list
+    // People outside the owner's circle — guests, and signed-in strangers who
+    // only have the link — can hold a limited number of items per list.
+    // "given" still counts: otherwise a holder could advance each claim and
+    // start again until the whole list was taken.
+    const cap = list.guest_claim_cap || 3;
     if (isGuest) {
-      const cap = list.guest_claim_cap || 3;
-      const normTarget = normalizeEmailForCap(guestEmail);
-      const activeGuestClaims = db.prepare(`
-        SELECT guest_email, qty
-        FROM claims
-        WHERE list_id = ? AND guest_email IS NOT NULL
-          AND status IN ('pending_verification', 'reserved', 'purchased')
-      `).all(list.id);
+      const normTarget = normalizeEmailForCap(email);
+      const mine = db.prepare(`
+        SELECT id, guest_email, qty, status FROM claims
+        WHERE list_id = ? AND claimer_user_id IS NULL AND guest_email IS NOT NULL
+          AND status IN ('pending_verification', 'reserved', 'purchased', 'given')
+        ORDER BY created_at ASC
+      `).all(list.id).filter(c => normalizeEmailForCap(c.guest_email) === normTarget);
 
-      const openGuestCount = activeGuestClaims
-        .filter(c => normalizeEmailForCap(c.guest_email) === normTarget)
-        .reduce((sum, c) => sum + (c.qty || 1), 0);
-
-      if (openGuestCount + requestedQty > cap) {
-        throw new Error(`Guest claim limit reached: maximum ${cap} open reservations per list for guest email ${guestEmail}`);
+      const held = mine.filter(c => c.status !== 'pending_verification').reduce((sum, c) => sum + (c.qty || 1), 0);
+      if (held + requestedQty > cap) {
+        throw conflict(`Guests can hold up to ${cap} items on a list. Sign in to reserve more.`);
+      }
+      // Unverified requests never block the real owner of the address: when
+      // there are too many, the oldest are dropped to make room.
+      const pending = mine.filter(c => c.status === 'pending_verification');
+      while (pending.length >= cap) {
+        const stale = pending.shift();
+        db.prepare("UPDATE claims SET status = 'expired', verification_code = NULL, updated_at = ? WHERE id = ?").run(nowIso, stale.id);
+        recordClaimEvent(db, stale.id, 'pending_verification', 'expired', 'system', null, 'Replaced by a newer request', nowIso);
+      }
+    } else if (viewerCtx.role === 'guest') {
+      const held = db.prepare(`
+        SELECT COALESCE(SUM(qty), 0) AS total FROM claims
+        WHERE list_id = ? AND claimer_user_id = ? AND status IN ('reserved', 'purchased', 'given')
+      `).get(list.id, claimerUserId).total;
+      if (held + requestedQty > cap) {
+        throw conflict(`You can hold up to ${cap} items on this list unless you are in the owner's circle.`);
       }
     }
 
-    // GVR-8 Concurrency Check: Check remaining quantity against verified active claims
     if (!item.always_wanted) {
-      const activeClaimed = db.prepare(`
-        SELECT COALESCE(SUM(qty), 0) AS total
-        FROM claims
-        WHERE item_id = ? AND verified = 1 AND status IN ('reserved', 'purchased', 'given')
-      `).get(item.id).total;
-
-      const remaining = item.qty_wanted - activeClaimed;
+      const remaining = item.qty_wanted - activeQuantity(db, item.id);
       if (requestedQty > remaining) {
-        // Record analytics event for over_claim_detected attempt prevented
-        db.prepare('INSERT INTO analytics_events (id, event_name, properties, created_at) VALUES (?, ?, ?, ?)').run(
-          uid('evt'),
-          'over_claim_detected',
-          JSON.stringify({ prevented: true, requested: requestedQty, remaining }),
-          nowIso
-        );
-        throw new Error(
-          remaining <= 0
-            ? 'Someone just claimed the last available unit of this item!'
-            : `Only ${remaining} unit(s) remaining for this item`
-        );
+        throw conflict(remaining <= 0
+          ? 'Someone just reserved the last one'
+          : `Only ${remaining} left to reserve`);
       }
     }
 
     const claimId = uid('clm');
-    const manageToken = uid('mng');
+    const manageToken = secretToken('mng');
     const expiryDays = list.claim_expiry_days || 7;
     const expiresAt = new Date(now.getTime() + expiryDays * 86400 * 1000).toISOString();
-
-    const verified = (!isGuest || autoVerifyGuest) ? 1 : 0;
+    const verified = isGuest ? 0 : 1;
     const status = verified ? 'reserved' : 'pending_verification';
-    const verificationCode = isGuest && !autoVerifyGuest
-      ? String(Math.floor(100000 + Math.random() * 900000))
-      : null;
-    const verificationExpiresAt = isGuest && !autoVerifyGuest
-      ? new Date(now.getTime() + 30 * 60 * 1000).toISOString() // 30 minutes per GVR-6
-      : null;
+    const verificationCode = isGuest ? sixDigitCode() : null;
+    const verificationExpiresAt = isGuest ? new Date(now.getTime() + 30 * 60 * 1000).toISOString() : null;
 
     db.prepare(`
       INSERT INTO claims (
@@ -213,478 +227,532 @@ export function createClaim(db, {
         qty, status, show_name_to_givers, expires_at, order_note, created_at, updated_at
       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
-      claimId,
-      item.id,
-      list.id,
-      claimerUserId,
-      guestEmail ? guestEmail.trim().toLowerCase() : null,
-      guestName ? guestName.trim() : null,
-      verified,
-      verificationCode,
-      verificationExpiresAt,
-      manageToken,
-      requestedQty,
-      status,
-      showNameToGivers ? 1 : 0,
-      expiresAt,
-      orderNote,
-      nowIso,
-      nowIso
+      claimId, item.id, list.id, claimerUserId,
+      email, isGuest ? (cleanText(guestName, 80) || null) : null,
+      verified, verificationCode, verificationExpiresAt, manageToken,
+      requestedQty, status, showNameToGivers ? 1 : 0, expiresAt,
+      cleanText(orderNote, 500) || null, nowIso, nowIso
     );
 
-    recordClaimEvent(db, claimId, null, status, 'giver', claimerUserId || guestEmail, 'Claim initiated', nowIso);
-
+    recordClaimEvent(db, claimId, null, status, 'giver', claimerUserId, 'Claim created', nowIso);
     db.prepare('INSERT INTO analytics_events (id, event_name, properties, created_at) VALUES (?, ?, ?, ?)').run(
-      uid('evt'),
-      'claim_created',
-      JSON.stringify({ guest_or_account: isGuest ? 'guest' : 'account', verified: Boolean(verified), quantity: requestedQty }),
+      uid('evt'), 'claim_created',
+      JSON.stringify({ guest_or_account: isGuest ? 'guest' : 'account', quantity: requestedQty }),
       nowIso
     );
 
-    if (isGuest && !verified) {
+    if (isGuest) {
       sendNotification(db, {
-        recipientEmail: guestEmail,
+        recipientEmail: email,
         eventType: 'guest_verification_code',
         listId: list.id,
-        subject: `Your Hushlist verification code: ${verificationCode}`,
-        body: `Enter code ${verificationCode} within 30 minutes to hold your reservation for "${item.title}". Manage link: /claim/${manageToken}`
+        subject: 'Your Hushlist verification code',
+        body: `Enter ${verificationCode} within 30 minutes to hold "${item.title}".`
       });
     }
 
-    db.exec('COMMIT');
-
     return {
-      id: claimId,
-      item_id: item.id,
-      list_id: list.id,
-      status,
-      verified: Boolean(verified),
-      qty: requestedQty,
-      manage_token: manageToken,
-      expires_at: expiresAt,
-      verification_required: !verified,
+      ...publicClaim(db.prepare('SELECT * FROM claims WHERE id = ?').get(claimId)),
+      verification_required: isGuest,
       verification_expires_at: verificationExpiresAt,
-      // Expose code in dev/demo response header or notification inspector so guest flow is testable in 1 click
-      demo_verification_code: verificationCode
+      ...(isGuest ? { verification_code: verificationCode } : {})
     };
-  } catch (err) {
-    try { db.exec('ROLLBACK'); } catch {}
-    throw err;
-  }
+  });
 }
 
 /**
- * Verifies a guest's 6-digit email verification code and locks in the reservation (GVR-6, GVR-8).
+ * Confirms a guest's 6-digit code. Only a correct code returns anything about
+ * the claim; on success the guest receives the manage token that lets this
+ * browser update or release the claim later.
  */
 export function verifyGuestClaim(db, { claimId, code }) {
-  db.exec('BEGIN IMMEDIATE');
-  try {
-    const nowIso = new Date().toISOString();
-    purgeExpiredClaims(db, nowIso);
+  const nowIso = new Date().toISOString();
+  purgeExpiredClaims(db, nowIso);
 
-    const claim = db.prepare('SELECT * FROM claims WHERE id = ?').get(claimId);
-    if (!claim) throw new Error('Reservation not found');
-    if (claim.verified === 1) {
-      db.exec('COMMIT');
-      return { ...claim, already_verified: true };
-    }
-    if (claim.status === 'expired' || claim.status === 'released' || claim.status === 'withdrawn') {
-      throw new Error('Verification window (30 minutes) has expired or claim was locked');
-    }
+  const claim = db.prepare('SELECT * FROM claims WHERE id = ?').get(String(claimId ?? ''));
+  // One message for "no such claim", "not a guest claim" and "already verified":
+  // this endpoint is unauthenticated and must not confirm anything about a claim id.
+  if (!claim || claim.claimer_user_id || claim.verified === 1) {
+    throw badRequest('That reservation cannot be verified. Start again from the list.');
+  }
+  if (claim.status !== 'pending_verification' || !claim.verification_code) {
+    throw badRequest('The 30-minute window has passed. Reserve the item again.');
+  }
 
-    // ADV-3.1: Enforce 5-attempt brute-force lockout on 6-digit guest verification codes
-    if (String(claim.verification_code) !== String(code || '').trim()) {
-      const nextAttempts = (claim.verification_attempts || 0) + 1;
-      if (nextAttempts >= 5) {
-        db.prepare(`
-          UPDATE claims
-          SET verification_attempts = ?, status = 'expired', verification_code = NULL, updated_at = ?
-          WHERE id = ?
-        `).run(nextAttempts, nowIso, claim.id);
-        recordClaimEvent(db, claim.id, 'pending_verification', 'expired', 'system', claim.guest_email, 'Locked after 5 failed verification attempts', nowIso);
-        db.exec('COMMIT');
-        throw new Error('Too many failed verification attempts (max 5). Reservation has been cancelled.');
-      }
-      db.prepare('UPDATE claims SET verification_attempts = ?, updated_at = ? WHERE id = ?').run(nextAttempts, nowIso, claim.id);
-      db.exec('COMMIT');
-      throw new Error(`Invalid 6-digit verification code (${5 - nextAttempts} attempt(s) remaining)`);
+  if (!safeEqual(claim.verification_code, String(code ?? '').trim())) {
+    const attempts = (claim.verification_attempts || 0) + 1;
+    if (attempts >= MAX_VERIFY_ATTEMPTS) {
+      db.prepare(`
+        UPDATE claims SET verification_attempts = ?, status = 'expired', verification_code = NULL, updated_at = ?
+        WHERE id = ?
+      `).run(attempts, nowIso, claim.id);
+      recordClaimEvent(db, claim.id, 'pending_verification', 'expired', 'system', null, 'Too many wrong codes', nowIso);
+      throw badRequest('Too many wrong codes. The reservation was cancelled.');
     }
+    db.prepare('UPDATE claims SET verification_attempts = ?, updated_at = ? WHERE id = ?').run(attempts, nowIso, claim.id);
+    const left = MAX_VERIFY_ATTEMPTS - attempts;
+    throw badRequest(`That code is not right (${left} attempt${left === 1 ? '' : 's'} left)`);
+  }
 
+  let lostRace = false;
+  const result = inTransaction(db, () => {
     const item = db.prepare("SELECT * FROM items WHERE id = ? AND status = 'active'").get(claim.item_id);
-    if (!item) throw new Error('Item is no longer available');
+    if (!item) throw notFound('That item is no longer on the list');
 
-    if (!item.always_wanted) {
-      const activeClaimed = db.prepare(`
-        SELECT COALESCE(SUM(qty), 0) AS total
-        FROM claims
-        WHERE item_id = ? AND verified = 1 AND status IN ('reserved', 'purchased', 'given')
-      `).get(item.id).total;
-
-      if (activeClaimed + claim.qty > item.qty_wanted) {
-        db.prepare("UPDATE claims SET status = 'released', updated_at = ? WHERE id = ?").run(nowIso, claim.id);
-        db.exec('COMMIT');
-        throw new Error('Another giver verified a claim for the last unit while your verification was pending');
-      }
+    if (!item.always_wanted && activeQuantity(db, item.id) + claim.qty > item.qty_wanted) {
+      db.prepare("UPDATE claims SET status = 'released', verification_code = NULL, updated_at = ? WHERE id = ?").run(nowIso, claim.id);
+      recordClaimEvent(db, claim.id, 'pending_verification', 'released', 'system', null, 'Item was taken before verification', nowIso);
+      lostRace = true;
+      return null;
     }
 
     db.prepare(`
-      UPDATE claims
-      SET verified = 1, status = 'reserved', verification_code = NULL, updated_at = ?
+      UPDATE claims SET verified = 1, status = 'reserved', verification_code = NULL, updated_at = ?
       WHERE id = ?
     `).run(nowIso, claim.id);
-
-    recordClaimEvent(db, claim.id, 'pending_verification', 'reserved', 'giver', claim.guest_email, 'Guest email verified', nowIso);
-    db.exec('COMMIT');
-
+    recordClaimEvent(db, claim.id, 'pending_verification', 'reserved', 'giver', null, 'Guest email verified', nowIso);
     return db.prepare('SELECT * FROM claims WHERE id = ?').get(claim.id);
-  } catch (err) {
-    try { db.exec('ROLLBACK'); } catch {}
-    throw err;
-  }
+  });
+
+  if (lostRace) throw conflict('Someone else reserved this while you were verifying');
+  return { ...publicClaim(result), manage_token: result.manage_token };
 }
 
+const CLAIMER_TRANSITIONS = {
+  reserved: ['purchased', 'released'],
+  purchased: ['given', 'reserved', 'released'],
+  given: ['purchased']
+};
+
 /**
- * Updates claim status (reserved -> purchased -> given, or released) by giver, helper (LST-4), or admin (ADM-1).
- * ADV-2.2: Never trusts client-supplied `actorType === 'admin'`; verifies actual user `is_admin` in DB.
- * ADV-3.3: Prevents terminal states (`released`, `expired`, `withdrawn`) from transitioning back to active states without a new quantity check.
+ * Changes a claim's state.
+ *
+ * - The claimer (signed-in owner of the claim, or a guest presenting the
+ *   manage token of a guest claim) may follow CLAIMER_TRANSITIONS.
+ * - A helper, guardian or admin acting on someone else's claim may only
+ *   release it, and cannot touch the claimer's note.
+ * - `asAdmin` is set by the admin route after it has checked the session; it
+ *   is re-checked here against the database and requires a reason.
  */
 export function transitionClaimState(db, {
   claimId,
   newState,
-  actorType = 'giver', // 'giver', 'helper', 'admin', 'system'
   actorId = null,
   manageToken = null,
+  asAdmin = false,
   reason = null,
   orderNote = undefined
 }) {
-  const validStates = new Set(['reserved', 'purchased', 'given', 'released']);
-  if (!validStates.has(newState)) {
-    throw new Error(`Invalid target claim state: ${newState}`);
-  }
+  // Holds that have run out are closed first, so a lapsed reservation cannot
+  // be confirmed just because nobody has loaded the list since.
+  purgeExpiredClaims(db);
 
-  const claim = db.prepare('SELECT * FROM claims WHERE id = ?').get(claimId);
-  if (!claim) throw new Error('Claim not found');
+  return inTransaction(db, () => {
+    const claim = db.prepare('SELECT * FROM claims WHERE id = ?').get(String(claimId ?? ''));
+    if (!claim) throw notFound('Reservation not found');
 
-  // ADV-3.3: Block复活/reactivation of terminal claims ('released', 'expired', 'withdrawn') or unverified claims
-  if (['released', 'expired', 'withdrawn'].includes(claim.status) && newState !== 'released') {
-    throw new Error(`Cannot transition a ${claim.status} claim back to ${newState}; please create a new reservation`);
-  }
-  if (claim.status === 'pending_verification' && newState !== 'released') {
-    throw new Error('Guest email must be verified with the 6-digit code before confirming purchase');
-  }
+    const list = db.prepare('SELECT * FROM lists WHERE id = ?').get(claim.list_id);
 
-  const list = db.prepare('SELECT * FROM lists WHERE id = ?').get(claim.list_id);
-
-  // ADV-2.2: Verify actual admin status from DB, never from untrusted request body
-  const actorUser = actorId ? db.prepare("SELECT * FROM users WHERE id = ? AND status = 'active'").get(actorId) : null;
-  const isVerifiedAdmin = Boolean(actorUser && actorUser.is_admin === 1 && actorType === 'admin');
-  if (actorType === 'admin' && !isVerifiedAdmin) {
-    throw new Error('Unauthorized: Admin privileges required for admin claim override');
-  }
-
-  // ADM-1: Every admin override MUST include a non-empty audit reason
-  if (isVerifiedAdmin && (!reason || !String(reason).trim())) {
-    throw new Error('Admin claim overrides require an audit reason (ADM-1)');
-  }
-
-  const isOwnGiver = (actorId && claim.claimer_user_id === actorId) || (manageToken && claim.manage_token === manageToken);
-  let isAuthorized = isOwnGiver || isVerifiedAdmin;
-  let resolvedActorType = isVerifiedAdmin ? 'admin' : 'giver';
-
-  if (!isAuthorized && actorId) {
-    // Check if actor is a named List Helper (LST-4) or Guardian of child list
-    const helperShare = db.prepare(
-      "SELECT 1 FROM list_shares WHERE list_id = ? AND grantee_type = 'user' AND grantee_id = ? AND permission = 'helper'"
-    ).get(claim.list_id, actorId);
-    const guardianLink = list ? db.prepare(
-      'SELECT 1 FROM guardian_links WHERE guardian_id = ? AND dependent_id = ?'
-    ).get(actorId, list.owner_id) : null;
-
-    if (helperShare || guardianLink) {
-      isAuthorized = true;
-      resolvedActorType = helperShare ? 'helper' : 'giver';
+    // An admin must not be able to act on (or learn about) claims on a list
+    // they own while it is in surprise mode. Same answer as "no such claim".
+    if (asAdmin && list && !ownerCanSeeClaims(list) && getViewerRole(db, list, actorId).role === 'owner') {
+      throw notFound('Reservation not found');
     }
-  }
+    const actor = actorId ? db.prepare("SELECT * FROM users WHERE id = ? AND status = 'active'").get(actorId) : null;
 
-  if (!isAuthorized) {
-    throw new Error('Unauthorized to modify this claim');
-  }
+    const isClaimer = Boolean(
+      (actor && claim.claimer_user_id === actor.id) ||
+      // A manage token only ever speaks for a guest claim.
+      (!claim.claimer_user_id && manageToken && safeEqual(claim.manage_token, manageToken))
+    );
 
-  const nowIso = new Date().toISOString();
-  const noteToSave = orderNote !== undefined ? orderNote : claim.order_note;
+    let actorType = null;
+    if (isClaimer) {
+      actorType = 'giver';
+    } else if (asAdmin) {
+      if (!actor || actor.is_admin !== 1) throw forbidden('Admin privileges required');
+      if (!reason || !String(reason).trim()) throw badRequest('An audit reason is required');
+      actorType = 'admin';
+    } else if (actor && list) {
+      const helper = db.prepare(
+        "SELECT 1 FROM list_shares WHERE list_id = ? AND grantee_type = 'user' AND grantee_id = ? AND permission = 'helper'"
+      ).get(list.id, actor.id);
+      if (helper) actorType = 'helper';
+      else if (isGuardianOf(db, actor.id, list.owner_id)) actorType = 'guardian';
+    }
+    if (!actorType) throw forbidden('You cannot change this reservation');
 
-  db.prepare(`
-    UPDATE claims
-    SET status = ?, order_note = ?, updated_at = ?
-    WHERE id = ?
-  `).run(newState, noteToSave, nowIso, claim.id);
+    if (actorType === 'giver') {
+      if (claim.status === 'pending_verification') {
+        throw badRequest('Verify your email first');
+      }
+      const allowed = CLAIMER_TRANSITIONS[claim.status] || [];
+      if (!allowed.includes(newState)) {
+        throw conflict(['released', 'expired', 'withdrawn'].includes(claim.status)
+          ? 'This reservation is closed. Reserve the item again if it is still available.'
+          : `A ${claim.status} reservation cannot be changed to ${cleanText(newState, 20) || 'that'}`);
+      }
+    } else {
+      if (newState !== 'released') throw forbidden('You can only release this reservation');
+      if (!['pending_verification', 'reserved', 'purchased'].includes(claim.status)) {
+        throw conflict('This reservation is already closed');
+      }
+    }
 
-  recordClaimEvent(db, claim.id, claim.status, newState, resolvedActorType, actorId || claim.guest_email, reason || `Changed to ${newState}`, nowIso);
+    const nowIso = new Date().toISOString();
+    const noteToSave = (actorType === 'giver' && orderNote !== undefined)
+      ? (cleanText(orderNote, 500) || null)
+      : claim.order_note;
 
-  db.prepare('INSERT INTO analytics_events (id, event_name, properties, created_at) VALUES (?, ?, ?, ?)').run(
-    uid('evt'),
-    'claim_state_changed',
-    JSON.stringify({ from: claim.status, to: newState, actor: resolvedActorType }),
-    nowIso
-  );
+    db.prepare('UPDATE claims SET status = ?, order_note = ?, verification_code = NULL, updated_at = ? WHERE id = ?')
+      .run(newState, noteToSave, nowIso, claim.id);
 
-  // If a helper or admin released someone else's claim, notify the claimer (never the owner!)
-  if ((resolvedActorType === 'helper' || resolvedActorType === 'admin') && newState === 'released') {
-    const item = db.prepare('SELECT title FROM items WHERE id = ?').get(claim.item_id);
-    sendNotification(db, {
-      recipientUserId: claim.claimer_user_id,
-      recipientEmail: claim.guest_email,
-      eventType: 'claimed_item_changed',
-      listId: claim.list_id,
-      subject: `Your reservation for "${item?.title || 'item'}" was released`,
-      body: `A list ${resolvedActorType} released your reservation${reason ? ` (${reason})` : ''}.`
-    });
-  }
+    const cleanReason = cleanText(reason, 300) || null;
+    recordClaimEvent(db, claim.id, claim.status, newState, actorType, actor?.id || null, cleanReason || `Changed to ${newState}`, nowIso);
 
-  return db.prepare('SELECT * FROM claims WHERE id = ?').get(claim.id);
+    db.prepare('INSERT INTO analytics_events (id, event_name, properties, created_at) VALUES (?, ?, ?, ?)').run(
+      uid('evt'), 'claim_state_changed',
+      JSON.stringify({ from: claim.status, to: newState, actor: actorType }), nowIso
+    );
+
+    if (actorType !== 'giver') {
+      const item = db.prepare('SELECT title FROM items WHERE id = ?').get(claim.item_id);
+      sendNotification(db, {
+        recipientUserId: claim.claimer_user_id,
+        recipientEmail: claim.guest_email,
+        eventType: 'claimed_item_changed',
+        listId: claim.list_id,
+        subject: `Your hold on "${item?.title || 'an item'}" was released`,
+        body: `${actorType === 'admin' ? 'An administrator' : 'Someone helping with the list'} released your reservation${cleanReason ? ` (${cleanReason})` : ''}.`
+      });
+    }
+
+    return publicClaim(db.prepare('SELECT * FROM claims WHERE id = ?').get(claim.id));
+  });
+}
+
+function requireEditor(db, item, actorId) {
+  const list = item ? db.prepare('SELECT * FROM lists WHERE id = ?').get(item.list_id) : null;
+  if (!item || !list) throw notFound('Item not found');
+  if (!getViewerRole(db, list, actorId).canEdit) throw forbidden('You cannot change items on this list');
+  return list;
 }
 
 /**
- * Section 14 Edge Case 1, 2, 3: Owner deletes an item or marks "Got it" themselves.
- * - If claim is 'reserved': claim moves to 'withdrawn', claimer told "no longer wanted, no need to buy".
- * - If claim is 'purchased' or 'given': item is hidden, claim kept as 'purchased'/'given' for claimer's records,
- *   claimer told "already bought? keep it as a gift or return it".
- * - Owner response is IDENTICAL whether 0 or N claims existed!
+ * Owner deletes an item or marks it "got it myself".
+ * Reserved claims become withdrawn and the giver is told not to buy; purchased
+ * claims are kept for the giver's records. The return value is the same
+ * whether zero or many claims existed.
  */
 export function handleOwnerDeleteOrGotIt(db, { itemId, ownerId, mode = 'deleted' }) {
-  const item = db.prepare('SELECT * FROM items WHERE id = ?').get(itemId);
-  if (!item) throw new Error('Item not found');
+  return inTransaction(db, () => {
+    const item = db.prepare('SELECT * FROM items WHERE id = ?').get(String(itemId ?? ''));
+    const list = requireEditor(db, item, ownerId);
 
-  const list = db.prepare('SELECT * FROM lists WHERE id = ?').get(item.list_id);
-  const coOwners = safeJsonParse(list?.co_owner_ids, []);
-  const isGuardian = db.prepare('SELECT 1 FROM guardian_links WHERE guardian_id = ? AND dependent_id = ?').get(ownerId, list?.owner_id);
-  if (!list || (list.owner_id !== ownerId && !coOwners.includes(ownerId) && !isGuardian)) {
-    throw new Error('Unauthorized');
-  }
+    const nowIso = new Date().toISOString();
+    const targetStatus = mode === 'got_it' ? 'got_it' : 'deleted';
+    const constant = { id: item.id, list_id: item.list_id, status: targetStatus };
 
-  const nowIso = new Date().toISOString();
-  const targetStatus = mode === 'got_it' ? 'got_it' : 'deleted';
+    if (item.status === 'deleted' || item.status === 'got_it') return constant;
 
-  db.prepare('UPDATE items SET status = ?, updated_at = ? WHERE id = ?').run(targetStatus, nowIso, item.id);
+    db.prepare('UPDATE items SET status = ?, updated_at = ? WHERE id = ?').run(targetStatus, nowIso, item.id);
 
-  // Process any active claims silently behind the scenes without leaking anything to the owner
-  const claims = db.prepare(`
-    SELECT * FROM claims
-    WHERE item_id = ? AND status IN ('pending_verification', 'reserved', 'purchased')
-  `).all(item.id);
+    const claims = db.prepare(`
+      SELECT * FROM claims
+      WHERE item_id = ? AND status IN ('pending_verification', 'reserved', 'purchased')
+    `).all(item.id);
 
-  for (const c of claims) {
-    if (c.status === 'reserved' || c.status === 'pending_verification') {
-      db.prepare("UPDATE claims SET status = 'withdrawn', updated_at = ? WHERE id = ?").run(nowIso, c.id);
-      recordClaimEvent(db, c.id, c.status, 'withdrawn', 'system', null, `Owner marked item ${targetStatus}`, nowIso);
+    for (const c of claims) {
+      if (c.status === 'purchased') {
+        recordClaimEvent(db, c.id, 'purchased', 'purchased', 'system', null, `Owner removed item (${targetStatus}); kept for the giver`, nowIso);
+        sendNotification(db, {
+          recipientUserId: c.claimer_user_id,
+          recipientEmail: c.guest_email,
+          eventType: 'claimed_item_withdrawn',
+          listId: list.id,
+          subject: `Heads up about "${item.title}"`,
+          body: `"${item.title}" was taken off the list. If you already bought it you can still give it or return it — your record is kept under your gifts.`
+        });
+      } else {
+        db.prepare("UPDATE claims SET status = 'withdrawn', verification_code = NULL, updated_at = ? WHERE id = ?").run(nowIso, c.id);
+        recordClaimEvent(db, c.id, c.status, 'withdrawn', 'system', null, `Owner marked item ${targetStatus}`, nowIso);
+        sendNotification(db, {
+          recipientUserId: c.claimer_user_id,
+          recipientEmail: c.guest_email,
+          eventType: 'claimed_item_withdrawn',
+          listId: list.id,
+          subject: `"${item.title}" is no longer needed`,
+          body: `"${item.title}" was taken off the list, so there is no need to buy it. Your reservation has been cancelled.`
+        });
+      }
+    }
+
+    const pledges = db.prepare("SELECT * FROM contributions WHERE item_id = ? AND status = 'pledged'").all(item.id);
+    for (const p of pledges) {
+      db.prepare("UPDATE contributions SET status = 'withdrawn' WHERE id = ?").run(p.id);
       sendNotification(db, {
-        recipientUserId: c.claimer_user_id,
-        recipientEmail: c.guest_email,
+        recipientUserId: p.contributor_user_id,
+        recipientEmail: p.guest_email,
         eventType: 'claimed_item_withdrawn',
         listId: list.id,
-        subject: `Update on "${item.title}": no longer needed`,
-        body: `The list owner removed "${item.title}" from their list (no longer wanted, no need to buy). Your reservation has been withdrawn.`
-      });
-    } else if (c.status === 'purchased') {
-      // Keep as 'purchased' for the claimer's records!
-      recordClaimEvent(db, c.id, 'purchased', 'purchased', 'system', null, `Owner removed item (${targetStatus}); kept in claimer history`, nowIso);
-      sendNotification(db, {
-        recipientUserId: c.claimer_user_id,
-        recipientEmail: c.guest_email,
-        eventType: 'claimed_item_withdrawn',
-        listId: list.id,
-        subject: `Heads up about "${item.title}"`,
-        body: `The list owner removed "${item.title}" from their list. Already bought? You can still give it as a gift or return it—we kept your purchase record in "My Claims".`
+        subject: `"${item.title}" is no longer needed`,
+        body: `"${item.title}" was taken off the list, so your pledge toward it was cancelled.`
       });
     }
-  }
 
-  // Return a constant, spoiler-free response to the owner
-  return {
-    id: item.id,
-    list_id: item.list_id,
-    status: targetStatus,
-    updated_at: nowIso
-  };
+    return constant;
+  });
 }
 
 /**
- * Section 14 Edge Case 4 & 5: Owner edits size, color, notes, or lowers quantity below claimed units.
- * - Edits to size/color/notes keep claims and notify claimers with old & new values side by side.
- * - Lowering qty_wanted below claimed units releases newest unpurchased ('reserved') claims first while keeping 'purchased' claims.
- * - Owner sees an ordinary edit response with zero mention of claims.
+ * Owner edits an item. Claims are kept; givers are told what changed. If the
+ * quantity drops below what is claimed, the newest unpurchased holds are
+ * released first and purchased ones are never touched.
  */
 export function handleOwnerEditItem(db, { itemId, ownerId, updates }) {
-  const item = db.prepare('SELECT * FROM items WHERE id = ?').get(itemId);
-  if (!item) throw new Error('Item not found');
+  if (!updates || typeof updates !== 'object' || Array.isArray(updates)) throw badRequest('Nothing to update');
 
-  const list = db.prepare('SELECT * FROM lists WHERE id = ?').get(item.list_id);
-  const coOwners = safeJsonParse(list?.co_owner_ids, []);
-  const isGuardian = db.prepare('SELECT 1 FROM guardian_links WHERE guardian_id = ? AND dependent_id = ?').get(ownerId, list?.owner_id);
-  if (!list || (list.owner_id !== ownerId && !coOwners.includes(ownerId) && !isGuardian)) {
-    throw new Error('Unauthorized');
-  }
+  return inTransaction(db, () => {
+    const item = db.prepare('SELECT * FROM items WHERE id = ?').get(String(itemId ?? ''));
+    const list = requireEditor(db, item, ownerId);
+    if (item.status !== 'active' && item.status !== 'received') throw notFound('Item not found');
 
-  const nowIso = new Date().toISOString();
-  const newTitle = updates.title !== undefined ? updates.title : item.title;
-  const newVariant = updates.variant !== undefined ? updates.variant : item.variant;
-  const newNotes = updates.notes !== undefined ? updates.notes : item.notes;
-  const newPrice = updates.price !== undefined ? Number(updates.price) : item.price;
-  const newPriority = updates.priority !== undefined ? updates.priority : item.priority;
-  const newQtyWanted = updates.qty_wanted !== undefined ? Math.max(1, Number(updates.qty_wanted)) : item.qty_wanted;
-  const newAnySimilar = updates.any_similar !== undefined ? (updates.any_similar ? 1 : 0) : item.any_similar;
-  const newAlwaysWanted = updates.always_wanted !== undefined ? (updates.always_wanted ? 1 : 0) : item.always_wanted;
-  const newAllowChipIn = updates.allow_group_chip_in !== undefined ? (updates.allow_group_chip_in ? 1 : 0) : item.allow_group_chip_in;
-  const newGivingInstructions = updates.giving_instructions !== undefined ? updates.giving_instructions : item.giving_instructions;
+    const has = (key) => updates[key] !== undefined;
+    const nowIso = new Date().toISOString();
 
-  db.prepare(`
-    UPDATE items
-    SET title = ?, variant = ?, notes = ?, price = ?, priority = ?, qty_wanted = ?,
-        any_similar = ?, always_wanted = ?, allow_group_chip_in = ?, giving_instructions = ?, updated_at = ?
-    WHERE id = ?
-  `).run(
-    newTitle, newVariant, newNotes, newPrice, newPriority, newQtyWanted,
-    newAnySimilar, newAlwaysWanted, newAllowChipIn, newGivingInstructions, nowIso, item.id
-  );
+    const newTitle = has('title') ? cleanText(updates.title, 300) : item.title;
+    if (!newTitle) throw badRequest('Give the item a title');
 
-  // Edge Case 4: Did size/color (variant) or notes change?
-  const variantChanged = (item.variant || '') !== (newVariant || '');
-  const notesChanged = (item.notes || '') !== (newNotes || '');
-  if (variantChanged || notesChanged) {
-    const activeClaims = db.prepare(`
-      SELECT * FROM claims WHERE item_id = ? AND status IN ('reserved', 'purchased') AND verified = 1
-    `).all(item.id);
-
-    const diffLines = [];
-    if (variantChanged) diffLines.push(`Size/Color: "${item.variant || 'none'}" -> "${newVariant || 'none'}"`);
-    if (notesChanged) diffLines.push(`Notes: "${item.notes || 'none'}" -> "${newNotes || 'none'}"`);
-
-    for (const c of activeClaims) {
-      sendNotification(db, {
-        recipientUserId: c.claimer_user_id,
-        recipientEmail: c.guest_email,
-        eventType: 'claimed_item_changed',
-        listId: list.id,
-        subject: `Details updated on "${newTitle}"`,
-        body: `The list owner updated details on an item you claimed:\n${diffLines.join('\n')}`
-      });
+    let newPrice = item.price;
+    if (has('price')) {
+      const blank = updates.price === null || updates.price === '';
+      newPrice = blank ? null : cleanPrice(updates.price);
+      if (!blank && newPrice === null) throw badRequest('Enter a valid price');
     }
-  }
 
-  // Edge Case 5: Did owner lower quantity below currently claimed units?
-  if (newQtyWanted < item.qty_wanted && !newAlwaysWanted) {
-    const allActive = db.prepare(`
-      SELECT * FROM claims
-      WHERE item_id = ? AND status IN ('reserved', 'purchased', 'given') AND verified = 1
-      ORDER BY CASE WHEN status = 'reserved' THEN 0 ELSE 1 END ASC, created_at DESC
-    `).all(item.id);
+    let newUrl = item.canonical_url;
+    if (has('url')) newUrl = updates.url ? canonicalizeUrl(updates.url) : null;
 
-    let totalClaimed = allActive.reduce((s, c) => s + c.qty, 0);
-    for (const c of allActive) {
-      if (totalClaimed <= newQtyWanted) break;
-      // Release newest unpurchased ('reserved') claims first; never release 'purchased' or 'given'
-      if (c.status === 'reserved') {
+    const newVariant = has('variant') ? (cleanText(updates.variant, 200) || null) : item.variant;
+    const newNotes = has('notes') ? (cleanText(updates.notes, 2000) || null) : item.notes;
+    const newStore = has('store') ? (cleanText(updates.store, 120) || item.store) : item.store;
+    const newPriority = has('priority') && PRIORITIES.includes(updates.priority) ? updates.priority : item.priority;
+    const newQtyWanted = has('qty_wanted') ? cleanInt(updates.qty_wanted, 1, 999, item.qty_wanted) : item.qty_wanted;
+    const flag = (key, current) => (has(key) ? (updates[key] ? 1 : 0) : current);
+    const newAnySimilar = flag('any_similar', item.any_similar);
+    const newAlwaysWanted = flag('always_wanted', item.always_wanted);
+    const newAllowChipIn = flag('allow_group_chip_in', item.allow_group_chip_in);
+    const newGivingInstructions = has('giving_instructions')
+      ? (cleanText(updates.giving_instructions, 500) || null)
+      : item.giving_instructions;
+
+    db.prepare(`
+      UPDATE items
+      SET title = ?, canonical_url = ?, store = ?, variant = ?, notes = ?, price = ?, priority = ?, qty_wanted = ?,
+          any_similar = ?, always_wanted = ?, allow_group_chip_in = ?, giving_instructions = ?, updated_at = ?
+      WHERE id = ?
+    `).run(
+      newTitle, newUrl, newStore, newVariant, newNotes, newPrice, newPriority, newQtyWanted,
+      newAnySimilar, newAlwaysWanted, newAllowChipIn, newGivingInstructions, nowIso, item.id
+    );
+
+    if (newPrice !== item.price && newPrice !== null) {
+      const hasHistory = db.prepare('SELECT 1 FROM price_snapshots WHERE item_id = ? LIMIT 1').get(item.id);
+      if (!hasHistory && item.price !== null) {
+        db.prepare('INSERT INTO price_snapshots (id, item_id, price, in_stock, checked_at) VALUES (?, ?, ?, ?, ?)')
+          .run(uid('ps'), item.id, item.price, item.in_stock, item.created_at);
+      }
+      db.prepare('INSERT INTO price_snapshots (id, item_id, price, in_stock, checked_at) VALUES (?, ?, ?, ?, ?)')
+        .run(uid('ps'), item.id, newPrice, item.in_stock, nowIso);
+    }
+
+    const variantChanged = (item.variant || '') !== (newVariant || '');
+    const notesChanged = (item.notes || '') !== (newNotes || '');
+    if (variantChanged || notesChanged) {
+      const activeClaims = db.prepare(`
+        SELECT * FROM claims WHERE item_id = ? AND status IN ('reserved', 'purchased') AND verified = 1
+      `).all(item.id);
+      const diffLines = [];
+      if (variantChanged) diffLines.push(`Size / colour: "${item.variant || 'none'}" → "${newVariant || 'none'}"`);
+      if (notesChanged) diffLines.push(`Notes: "${item.notes || 'none'}" → "${newNotes || 'none'}"`);
+      for (const c of activeClaims) {
+        sendNotification(db, {
+          recipientUserId: c.claimer_user_id,
+          recipientEmail: c.guest_email,
+          eventType: 'claimed_item_changed',
+          listId: list.id,
+          subject: `Details changed on "${newTitle}"`,
+          body: `An item you reserved was updated:\n${diffLines.join('\n')}`
+        });
+      }
+    }
+
+    const limitTightened = newQtyWanted < item.qty_wanted || (item.always_wanted === 1 && newAlwaysWanted === 0);
+    if (limitTightened && !newAlwaysWanted) {
+      const allActive = db.prepare(`
+        SELECT * FROM claims
+        WHERE item_id = ? AND status IN ('reserved', 'purchased', 'given') AND verified = 1
+        ORDER BY CASE WHEN status = 'reserved' THEN 0 ELSE 1 END ASC, created_at DESC
+      `).all(item.id);
+      let totalClaimed = allActive.reduce((s, c) => s + c.qty, 0);
+      for (const c of allActive) {
+        if (totalClaimed <= newQtyWanted) break;
+        if (c.status !== 'reserved') continue;
         db.prepare("UPDATE claims SET status = 'released', updated_at = ? WHERE id = ?").run(nowIso, c.id);
-        recordClaimEvent(db, c.id, 'reserved', 'released', 'system', null, 'Owner lowered quantity wanted below claimed units', nowIso);
+        recordClaimEvent(db, c.id, 'reserved', 'released', 'system', null, 'Quantity wanted was lowered', nowIso);
         totalClaimed -= c.qty;
         sendNotification(db, {
           recipientUserId: c.claimer_user_id,
           recipientEmail: c.guest_email,
           eventType: 'claimed_item_changed',
           listId: list.id,
-          subject: `Quantity reduced on "${newTitle}"`,
-          body: `The owner reduced the requested quantity for "${newTitle}", so your unpurchased reservation was released.`
+          subject: `Fewer wanted: "${newTitle}"`,
+          body: `Fewer of "${newTitle}" are wanted now, so your unpurchased reservation was released.`
         });
       }
     }
-  }
 
-  return db.prepare('SELECT * FROM items WHERE id = ?').get(item.id);
+    return db.prepare('SELECT * FROM items WHERE id = ?').get(item.id);
+  });
+}
+
+/** Owner marks an item as received. Matching claims become "given". */
+export function markItemReceived(db, { itemId, actorId, outsideApp = false }) {
+  return inTransaction(db, () => {
+    const item = db.prepare('SELECT * FROM items WHERE id = ?').get(String(itemId ?? ''));
+    const list = requireEditor(db, item, actorId);
+    const constant = { received: true, item_id: item.id };
+    if (item.status !== 'active') return constant;
+
+    const nowIso = new Date().toISOString();
+    db.prepare(`
+      UPDATE items SET status = 'received', received_at = ?, received_outside_app = ?, updated_at = ? WHERE id = ?
+    `).run(nowIso, outsideApp ? 1 : 0, nowIso, item.id);
+
+    const matching = db.prepare("SELECT * FROM claims WHERE item_id = ? AND status IN ('pending_verification', 'reserved', 'purchased')").all(item.id);
+    for (const c of matching) {
+      if (c.status === 'pending_verification') {
+        db.prepare("UPDATE claims SET status = 'withdrawn', verification_code = NULL, updated_at = ? WHERE id = ?").run(nowIso, c.id);
+        recordClaimEvent(db, c.id, c.status, 'withdrawn', 'system', null, 'Item was marked received', nowIso);
+        continue;
+      }
+      db.prepare("UPDATE claims SET status = 'given', updated_at = ? WHERE id = ?").run(nowIso, c.id);
+      recordClaimEvent(db, c.id, c.status, 'given', 'system', null, 'Item was marked received', nowIso);
+      sendNotification(db, {
+        recipientUserId: c.claimer_user_id,
+        recipientEmail: c.guest_email,
+        eventType: 'claim_confirmed',
+        listId: list.id,
+        subject: `"${item.title}" arrived`,
+        body: `"${item.title}" was marked as received.`
+      });
+    }
+    return constant;
+  });
+}
+
+/** Closes a list: open holds are released (givers told), purchases are kept. */
+export function archiveList(db, list, { reason = 'the list was archived' } = {}) {
+  return inTransaction(db, () => {
+    const nowIso = new Date().toISOString();
+    db.prepare('UPDATE lists SET archived_at = COALESCE(archived_at, ?) WHERE id = ?').run(nowIso, list.id);
+    const open = db.prepare(`
+      SELECT c.*, i.title AS item_title FROM claims c
+      JOIN items i ON i.id = c.item_id
+      WHERE c.list_id = ? AND c.status IN ('pending_verification', 'reserved')
+    `).all(list.id);
+    for (const c of open) {
+      db.prepare("UPDATE claims SET status = 'released', verification_code = NULL, updated_at = ? WHERE id = ?").run(nowIso, c.id);
+      recordClaimEvent(db, c.id, c.status, 'released', 'system', null, `Released because ${reason}`, nowIso);
+      sendNotification(db, {
+        recipientUserId: c.claimer_user_id,
+        recipientEmail: c.guest_email,
+        eventType: 'claimed_item_withdrawn',
+        listId: list.id,
+        subject: `"${list.name}" was closed`,
+        body: `Your unpurchased hold on "${c.item_title}" was released because ${reason}.`
+      });
+    }
+  });
 }
 
 /**
- * GVR-4: Add a group contribution ("chip in") toward an expensive item.
- * ADV-1.5, ADV-2.5, ADV-3.4:
- * - Enforces BEGIN IMMEDIATE transaction.
- * - Requires item.allow_group_chip_in === 1.
- * - Rejects self-contribution by the list owner or co-owners.
- * - Enforces list visibility (`getViewerRole().canView`).
- * - Caps pledged amount so a prankster cannot pledge $1,000,000 or over-fund beyond remaining target.
+ * Re-opens an archived list for a new occasion. Archiving already released
+ * the open holds; gifts that were bought stay recorded and stay taken.
+ */
+export function reuseList(db, list, { eventDate = null } = {}) {
+  if (!list.archived_at) throw conflict('Archive the list first');
+  db.prepare('UPDATE lists SET archived_at = NULL, revealed_at = NULL, event_date = ? WHERE id = ?')
+    .run(eventDate || list.event_date, list.id);
+}
+
+/**
+ * Pledge toward a shared gift. Signed-in givers only: a pledge counts toward
+ * "fully funded", so an unverifiable guest pledge could mark an item as taken.
  */
 export function addContribution(db, {
   itemId,
-  contributorUserId = null,
-  guestEmail = null,
-  guestName = null,
+  contributorUserId,
   pledgedAmount,
   showNameToGivers = true,
   note = null
 }) {
-  const amount = Number(pledgedAmount);
-  if (!Number.isFinite(amount) || amount <= 0) {
-    throw new Error('Pledged contribution amount must be greater than 0');
-  }
+  if (!contributorUserId) throw new AppError('Sign in to chip in', 401);
+  const amount = cleanPrice(pledgedAmount, 100_000);
+  if (amount === null || amount <= 0) throw badRequest('Enter an amount greater than zero');
 
-  db.exec('BEGIN IMMEDIATE');
-  try {
-    const item = db.prepare("SELECT * FROM items WHERE id = ? AND status = 'active'").get(itemId);
-    if (!item) throw new Error('Item not found');
-    if (!item.allow_group_chip_in) {
-      throw new Error('Group chip-in is not enabled on this item');
-    }
+  return inTransaction(db, () => {
+    const item = db.prepare("SELECT * FROM items WHERE id = ? AND status = 'active'").get(String(itemId ?? ''));
+    if (!item) throw notFound('That item is no longer on the list');
+    if (!item.allow_group_chip_in) throw badRequest('Chipping in is not turned on for this item');
 
     const list = db.prepare('SELECT * FROM lists WHERE id = ?').get(item.list_id);
-    if (!list || list.archived_at) throw new Error('List is archived or unavailable');
+    if (!list || list.archived_at) throw conflict('This list is closed');
 
     const coOwners = safeJsonParse(list.co_owner_ids, []);
-    if (contributorUserId && (contributorUserId === list.owner_id || coOwners.includes(contributorUserId))) {
-      throw new Error('List owners cannot pledge contributions to their own list items');
+    if (contributorUserId === list.owner_id || coOwners.includes(contributorUserId)) {
+      throw forbidden('You cannot chip in on your own list');
+    }
+    if (!getViewerRole(db, list, contributorUserId).canView) {
+      throw forbidden('You do not have access to this list');
     }
 
-    const viewerCtx = getViewerRole(db, list, contributorUserId);
-    if (!viewerCtx.canView) {
-      throw new Error('Unauthorized to view or contribute to this list');
-    }
-
-    if (!contributorUserId && (!guestEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(guestEmail))) {
-      throw new Error('A signed-in account or valid email is required to pledge a contribution');
-    }
-
-    if (item.price && item.price > 0) {
+    // Without a price there is no goal, so a pledge could never be bounded.
+    if (!(item.price > 0)) throw badRequest('This item needs a price before people can chip in');
+    {
       const currentPledged = db.prepare(`
         SELECT COALESCE(SUM(pledged_amount), 0) AS total
         FROM contributions
         WHERE item_id = ? AND status IN ('pledged', 'paid_off_platform')
       `).get(item.id).total;
-
-      const remainingTarget = Math.max(0, Math.round((item.price - currentPledged) * 100) / 100);
-      if (remainingTarget <= 0) {
-        throw new Error('This item has already reached its full group chip-in goal!');
-      }
-      if (amount > remainingTarget) {
-        throw new Error(`Pledge exceeds remaining chip-in goal ($${remainingTarget.toFixed(2)} remaining)`);
-      }
+      const remaining = Math.max(0, Math.round((item.price - currentPledged) * 100) / 100);
+      if (remaining <= 0) throw conflict('This gift is already fully funded');
+      if (amount > remaining) throw conflict(`Only $${remaining.toFixed(2)} is still needed`);
     }
 
     const id = uid('cnt');
-    const nowIso = new Date().toISOString();
-
     db.prepare(`
       INSERT INTO contributions (
-        id, item_id, list_id, contributor_user_id, guest_email, guest_name,
-        pledged_amount, currency, status, show_name_to_givers, note, created_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pledged', ?, ?, ?)
+        id, item_id, list_id, contributor_user_id, pledged_amount, currency, status, show_name_to_givers, note, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, 'pledged', ?, ?, ?)
     `).run(
-      id, item.id, item.list_id, contributorUserId, guestEmail, guestName,
-      amount, item.currency || 'USD', showNameToGivers ? 1 : 0, note, nowIso
+      id, item.id, item.list_id, contributorUserId, amount, item.currency || 'USD',
+      showNameToGivers ? 1 : 0, cleanText(note, 300) || null, new Date().toISOString()
     );
+    return publicContribution(db.prepare('SELECT * FROM contributions WHERE id = ?').get(id));
+  });
+}
 
-    db.exec('COMMIT');
-    return db.prepare('SELECT * FROM contributions WHERE id = ?').get(id);
-  } catch (err) {
-    try { db.exec('ROLLBACK'); } catch {}
-    throw err;
-  }
+export function withdrawContribution(db, { contributionId, actorId }) {
+  const row = db.prepare('SELECT * FROM contributions WHERE id = ?').get(String(contributionId ?? ''));
+  if (!row || row.contributor_user_id !== actorId) throw notFound('Pledge not found');
+  if (row.status !== 'pledged') throw conflict('This pledge can no longer be withdrawn');
+  db.prepare("UPDATE contributions SET status = 'withdrawn' WHERE id = ?").run(row.id);
+  return { id: row.id, status: 'withdrawn' };
+}
+
+function publicContribution(c) {
+  return { id: c.id, item_id: c.item_id, pledged_amount: c.pledged_amount, currency: c.currency, status: c.status, note: c.note };
 }
 
 export function recordClaimEvent(db, claimId, fromState, toState, actor, actorId, reason, atIso = new Date().toISOString()) {

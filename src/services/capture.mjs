@@ -13,68 +13,83 @@
  *   clear instruction to use the client-side browser extension or paste the browser-extracted payload.
  */
 
-import { uid } from '../db/schema.mjs';
+import net from 'node:net';
+import { uid, inTransaction } from '../db/schema.mjs';
+import { AppError, badRequest, forbidden, notFound } from '../errors.mjs';
 
 const TRACKING_PARAMS = new Set([
   'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content',
-  'fbclid', 'gclid', 'msclkid', 'mc_cid', 'mc_eid', '_ga', 'ref', 'ref_',
-  'psc', 'spLa', 'pf_rd_r', 'pf_rd_p', 'pd_rd_r', 'pd_rd_w', 'pd_rd_wg'
+  'fbclid', 'gclid', 'msclkid', 'mc_cid', 'mc_eid', '_ga'
 ]);
 
-// Section 17 Malicious URL blocklist
-const MALICIOUS_DOMAINS = new Set([
+// Only meaningful on Amazon. Elsewhere "ref" can be a real page parameter.
+const AMAZON_TRACKING_PARAMS = new Set([
+  'ref', 'ref_', 'psc', 'spLa', 'pf_rd_r', 'pf_rd_p', 'pd_rd_r', 'pd_rd_w', 'pd_rd_wg'
+]);
+
+// Placeholder denylist. These are reserved example names; a real deployment
+// should replace this with a maintained feed (HUSHLIST_BLOCKED_DOMAINS adds more).
+const BLOCKED_DOMAINS = new Set([
   'phishing-gifts.example.com',
   'malware-shop.test',
   'fake-login-retailer.org',
   'crypto-scam-giveaway.net',
-  'evil-redirect.invalid'
+  'evil-redirect.invalid',
+  ...String(process.env.HUSHLIST_BLOCKED_DOMAINS || '').split(',').map(d => d.trim().toLowerCase()).filter(Boolean)
 ]);
+
+// Addresses that must never be stored as a link or (if server-side fetching is
+// ever added) requested: loopback, private, link-local, CGNAT, multicast,
+// documentation and other reserved ranges. BlockList also matches the
+// IPv4-mapped IPv6 form (::ffff:a.b.c.d) against the IPv4 rules.
+const RESERVED_ADDRESSES = new net.BlockList();
+for (const [addr, prefix] of [
+  ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8],
+  ['169.254.0.0', 16], ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.0.2.0', 24],
+  ['192.168.0.0', 16], ['198.18.0.0', 15], ['198.51.100.0', 24], ['203.0.113.0', 24],
+  ['224.0.0.0', 4], ['240.0.0.0', 4]
+]) RESERVED_ADDRESSES.addSubnet(addr, prefix, 'ipv4');
+for (const [addr, prefix] of [
+  ['::', 127], ['fc00::', 7], ['fe80::', 10], ['ff00::', 8], ['2001:db8::', 32], ['64:ff9b::', 96]
+]) RESERVED_ADDRESSES.addSubnet(addr, prefix, 'ipv6');
 
 export function checkUrlSafety(rawUrl) {
   if (!rawUrl) return { safe: true };
+  if (typeof rawUrl !== 'string' || rawUrl.length > 2048) {
+    return { safe: false, reason: 'Invalid URL format' };
+  }
   let parsed;
   try {
-    parsed = new URL(String(rawUrl).trim());
+    parsed = new URL(rawUrl.trim());
   } catch {
     return { safe: false, reason: 'Invalid URL format' };
   }
   if (!['http:', 'https:'].includes(parsed.protocol)) {
     return { safe: false, reason: 'Only http and https URLs are permitted' };
   }
-  const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, '');
-  if (MALICIOUS_DOMAINS.has(host) || host.endsWith('.evil.test') || host.includes('phishing')) {
-    return { safe: false, reason: `Domain "${host}" is flagged on the malicious URL blocklist` };
+  if (parsed.username || parsed.password) {
+    return { safe: false, reason: 'URLs that embed a username or password are not permitted' };
+  }
+  // WHATWG URL parsing has already normalised decimal / hex / octal IPv4
+  // spellings to dotted form and lower-cased the host.
+  const host = parsed.hostname.replace(/^\[|\]$/g, '').replace(/\.$/, '');
+  if ([...BLOCKED_DOMAINS].some(d => host === d || host.endsWith(`.${d}`))) {
+    return { safe: false, reason: `Domain "${host}" is on the blocked list` };
   }
 
-  // ADV-4.2: SSRF protection against localhost, internal domains, IPv6 loopback, and RFC1918 / link-local IPs
   if (
     host === 'localhost' ||
     host.endsWith('.localhost') ||
     host.endsWith('.local') ||
     host.endsWith('.internal') ||
-    host === '::1' ||
-    host === '0:0:0:0:0:0:0:1' ||
-    host.startsWith('fe80:') ||
-    host.startsWith('fc00:') ||
-    host.startsWith('fd00:')
+    !host.includes('.') && net.isIP(host) === 0
   ) {
-    return { safe: false, reason: `SSRF Protection: internal/loopback host "${host}" is not allowed` };
+    return { safe: false, reason: `Internal host "${host}" is not allowed` };
   }
 
-  const ipv4Match = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-  if (ipv4Match) {
-    const [a, b] = [Number(ipv4Match[1]), Number(ipv4Match[2])];
-    if (
-      a === 0 ||
-      a === 10 ||
-      a === 127 ||
-      (a === 169 && b === 254) ||
-      (a === 172 && b >= 16 && b <= 31) ||
-      (a === 192 && b === 168) ||
-      a >= 224
-    ) {
-      return { safe: false, reason: `SSRF Protection: private/reserved IPv4 address "${host}" is not allowed` };
-    }
+  const family = net.isIP(host);
+  if (family !== 0 && RESERVED_ADDRESSES.check(host, family === 6 ? 'ipv6' : 'ipv4')) {
+    return { safe: false, reason: `Private or reserved address "${host}" is not allowed` };
   }
 
   return { safe: true, hostname: host };
@@ -89,12 +104,14 @@ export function canonicalizeUrl(rawUrl) {
   if (!rawUrl) return null;
   const safety = checkUrlSafety(rawUrl);
   if (!safety.safe) {
-    throw new Error(`Unsafe URL blocked: ${safety.reason}`);
+    throw badRequest(`Unsafe URL blocked: ${safety.reason}`);
   }
   try {
     const u = new URL(String(rawUrl).trim());
+    u.hostname = u.hostname.replace(/\.$/, '');
+    const onAmazon = isAmazonDomain(u.hostname);
     // Amazon ASIN canonicalization
-    if (isAmazonDomain(u.hostname)) {
+    if (onAmazon) {
       const asinMatch = u.pathname.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/i);
       if (asinMatch) {
         const tag = u.searchParams.get('tag');
@@ -102,7 +119,7 @@ export function canonicalizeUrl(rawUrl) {
       }
     }
     for (const key of [...u.searchParams.keys()]) {
-      if (TRACKING_PARAMS.has(key) || key.startsWith('utm_')) {
+      if (TRACKING_PARAMS.has(key) || key.startsWith('utm_') || (onAmazon && AMAZON_TRACKING_PARAMS.has(key))) {
         u.searchParams.delete(key);
       }
     }
@@ -114,36 +131,144 @@ export function canonicalizeUrl(rawUrl) {
 }
 
 export function isAmazonDomain(hostname = '') {
-  const h = hostname.toLowerCase();
-  return h === 'amazon.com' || h.endsWith('.amazon.com') ||
-         h === 'amazon.co.uk' || h.endsWith('.amazon.co.uk') ||
-         h === 'amazon.ca' || h.endsWith('.amazon.ca') ||
-         h === 'amazon.de' || h.endsWith('.amazon.de') ||
-         h === 'a.co' || h === 'amzn.to';
+  const h = String(hostname).toLowerCase().replace(/^www\./, '');
+  // amazon.com, amazon.co.uk, amazon.com.au, smile.amazon.de, … plus the short-link hosts.
+  return /(^|\.)amazon\.(com|[a-z]{2}|co\.[a-z]{2}|com\.[a-z]{2})$/.test(h) ||
+         ['a.co', 'amzn.to', 'amzn.eu', 'amzn.asia', 'amzn.com'].includes(h);
 }
 
-export function stripHtmlAndEscape(val) {
+const NAMED_ENTITIES = { amp: '&', quot: '"', apos: "'", lt: '<', gt: '>', nbsp: ' ' };
+
+/**
+ * Reduces untrusted input to plain single-line text: entities decoded, markup
+ * removed, control characters dropped, whitespace collapsed, length capped.
+ *
+ * The result is plain text, NOT HTML-safe text. Every place that puts it into
+ * a page must still escape it for that context (the front end does this
+ * automatically through its html`` template).
+ */
+export function cleanText(val, maxLength = 500) {
   if (val === null || val === undefined) return '';
-  return String(val)
-    .replace(/<script[\s\S]*?<\/script>/gi, '')
-    .replace(/<style[\s\S]*?<\/style>/gi, '')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/&amp;/g, '&')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&nbsp;/g, ' ')
+  if (typeof val !== 'string' && typeof val !== 'number') return '';
+  // Bound the work before doing any of it.
+  let text = String(val).slice(0, Math.min(20000, maxLength * 8 + 512));
+  // Decode first and repeat until stable, so "&lt;b&gt;" or "<scr<script>ipt>"
+  // cannot survive as markup after one pass.
+  for (let i = 0; i < 4; i++) {
+    const before = text;
+    text = stripTags(text
+      .replace(/&#(\d{1,7});/g, (_, n) => safeCodePoint(Number(n)))
+      .replace(/&#x([0-9a-f]{1,6});/gi, (_, n) => safeCodePoint(parseInt(n, 16)))
+      .replace(/&(amp|quot|apos|lt|gt|nbsp);/gi, (_, name) => NAMED_ENTITIES[name.toLowerCase()]));
+    if (text === before) break;
+  }
+  return text
+    .replace(/[\u0000-\u001f\u007f\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]/g, ' ')
     .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, maxLength)
     .trim();
 }
 
-export function toProxiedImageUrl(rawImageUrl) {
-  if (!rawImageUrl) return null;
-  if (rawImageUrl.startsWith('/api/image-proxy') || rawImageUrl.startsWith('data:image/')) {
-    return rawImageUrl;
+/**
+ * Removes tags, comments and whole <script>/<style> blocks in a single
+ * left-to-right scan. Deliberately not a regex: the obvious patterns
+ * (/<[^>]+>/, /<script[\s\S]*?<\/script>/) take quadratic time on input such
+ * as a long run of "<", which is enough to stall the server.
+ */
+export function stripTags(text) {
+  let out = '';
+  let pos = 0;
+  let moreClosers = true;
+  const lower = text.toLowerCase();
+  while (pos < text.length) {
+    const lt = text.indexOf('<', pos);
+    if (lt === -1) break;
+    out += text.slice(pos, lt);
+    const next = text.charCodeAt(lt + 1);
+    const isTagStart = (next >= 65 && next <= 90) || (next >= 97 && next <= 122) || next === 47 /* / */ || next === 33 /* ! */;
+    if (!isTagStart || !moreClosers) {
+      out += '<';
+      pos = lt + 1;
+      continue;
+    }
+    let end;
+    if (lower.startsWith('<!--', lt)) {
+      const close = text.indexOf('-->', lt + 4);
+      end = close === -1 ? -1 : close + 3;
+    } else if (lower.startsWith('<script', lt) || lower.startsWith('<style', lt)) {
+      const name = lower.startsWith('<script', lt) ? '</script' : '</style';
+      const close = lower.indexOf(name, lt);
+      const gt = close === -1 ? -1 : text.indexOf('>', close);
+      end = gt === -1 ? -1 : gt + 1;
+      if (end === -1) {
+        // Unterminated block: drop just the opening tag if it closes.
+        const openEnd = text.indexOf('>', lt);
+        end = openEnd === -1 ? -1 : openEnd + 1;
+      }
+    } else {
+      const gt = text.indexOf('>', lt);
+      end = gt === -1 ? -1 : gt + 1;
+    }
+    if (end === -1) {
+      // No closing ">" anywhere ahead: nothing further can be a tag.
+      moreClosers = false;
+      out += '<';
+      pos = lt + 1;
+      continue;
+    }
+    out += ' ';
+    pos = end;
   }
-  return `/api/image-proxy?url=${encodeURIComponent(rawImageUrl)}`;
+  return out + text.slice(pos);
+}
+
+function safeCodePoint(n) {
+  if (!Number.isInteger(n) || n < 0x20 || n > 0x10ffff || (n >= 0xd800 && n <= 0xdfff)) return ' ';
+  return String.fromCodePoint(n);
+}
+
+/** Multi-line variant for notes: keeps line breaks, otherwise the same rules. */
+export function cleanMultilineText(val, maxLength = 2000) {
+  if (val === null || val === undefined) return '';
+  return String(val).slice(0, 20000).split(/\r?\n/).map(line => cleanText(line, maxLength)).join('\n')
+    .replace(/\n{3,}/g, '\n\n').trim().slice(0, maxLength);
+}
+
+/** Finite, non-negative money amount rounded to cents, else null. */
+export function cleanPrice(val, max = 10_000_000) {
+  if (val === null || val === undefined || val === '') return null;
+  const n = typeof val === 'number' ? val : Number(String(val).trim());
+  if (!Number.isFinite(n) || n < 0 || n > max) return null;
+  return Math.round(n * 100) / 100;
+}
+
+export function cleanInt(val, min, max, fallback) {
+  const n = Number(val);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(n)));
+}
+
+/** Real calendar date in YYYY-MM-DD form, else null. */
+export function cleanDate(val) {
+  if (typeof val !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(val)) return null;
+  const d = new Date(`${val}T00:00:00Z`);
+  if (Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== val) return null;
+  const year = d.getUTCFullYear();
+  return year >= 2000 && year <= 2100 ? val : null;
+}
+
+/**
+ * Remote images are never requested by the server and are not shown by the
+ * app (the content security policy allows same-origin images only). The source
+ * URL is kept, wrapped in the local placeholder path, so a real image proxy
+ * can be added later without a data migration.
+ */
+export function toProxiedImageUrl(rawImageUrl) {
+  if (!rawImageUrl || typeof rawImageUrl !== 'string') return null;
+  if (rawImageUrl.startsWith('/api/image-proxy')) return rawImageUrl.slice(0, 2048);
+  if (!checkUrlSafety(rawImageUrl).safe) return null;
+  return `/api/image-proxy?url=${encodeURIComponent(rawImageUrl.trim())}`;
 }
 
 /**
@@ -152,9 +277,12 @@ export function toProxiedImageUrl(rawImageUrl) {
  */
 export function extractMetadataFromHtml(db, url, html = '', clientExtracted = null) {
   const startTime = Date.now();
+  html = typeof html === 'string' ? html.slice(0, 512_000) : '';
+  const lowerHtml = html.toLowerCase();
+  const tags = html ? tokenizeTags(html) : [];
   const safety = checkUrlSafety(url);
   if (!safety.safe) {
-    throw new Error(`Unsafe URL blocked: ${safety.reason}`);
+    throw badRequest(`Unsafe URL blocked: ${safety.reason}`);
   }
 
   const canonical = canonicalizeUrl(url);
@@ -190,37 +318,37 @@ export function extractMetadataFromHtml(db, url, html = '', clientExtracted = nu
   // Layer 0: If the client browser extension already extracted high-confidence fields from the live DOM
   if (clientExtracted && typeof clientExtracted === 'object') {
     if (clientExtracted.title) {
-      result.title = stripHtmlAndEscape(clientExtracted.title);
-      result.field_confidence.title = clientExtracted.field_confidence?.title ?? 0.98;
+      result.title = cleanText(clientExtracted.title);
+      result.field_confidence.title = confidence(clientExtracted.field_confidence?.title, 0.98);
       result.extraction_layers_used.title = 'client_extension';
     }
-    if (clientExtracted.image) {
+    if (typeof clientExtracted.image === 'string' && checkUrlSafety(clientExtracted.image).safe) {
       result.image = clientExtracted.image;
-      result.field_confidence.image = clientExtracted.field_confidence?.image ?? 0.98;
+      result.field_confidence.image = confidence(clientExtracted.field_confidence?.image, 0.98);
       result.extraction_layers_used.image = 'client_extension';
     }
-    if (clientExtracted.price !== undefined && clientExtracted.price !== null && !Number.isNaN(Number(clientExtracted.price))) {
-      result.price = Number(clientExtracted.price);
-      result.field_confidence.price = clientExtracted.field_confidence?.price ?? 0.98;
+    if (cleanPrice(clientExtracted.price) !== null) {
+      result.price = cleanPrice(clientExtracted.price);
+      result.field_confidence.price = confidence(clientExtracted.field_confidence?.price, 0.98);
       result.extraction_layers_used.price = 'client_extension';
     }
     if (clientExtracted.currency) {
-      result.currency = stripHtmlAndEscape(clientExtracted.currency).toUpperCase().slice(0, 3);
+      result.currency = cleanText(clientExtracted.currency).toUpperCase().slice(0, 3);
     }
     if (clientExtracted.variant) {
-      result.variant = stripHtmlAndEscape(clientExtracted.variant);
-      result.field_confidence.variant = clientExtracted.field_confidence?.variant ?? 0.95;
+      result.variant = cleanText(clientExtracted.variant);
+      result.field_confidence.variant = confidence(clientExtracted.field_confidence?.variant, 0.95);
       result.extraction_layers_used.variant = 'client_extension';
     }
     if (clientExtracted.store) {
-      result.store = stripHtmlAndEscape(clientExtracted.store);
+      result.store = cleanText(clientExtracted.store);
       result.field_confidence.store = 0.99;
     }
   }
 
   // Layer 1: Retailer Adapter (Top 30 stores configured in DB)
   if (html && adapter) {
-    const adapterHits = applyRetailerAdapter(html, adapter);
+    const adapterHits = applyRetailerAdapter(html, tags, adapter);
     if (!result.title && adapterHits.title) {
       result.title = adapterHits.title;
       result.field_confidence.title = 0.97;
@@ -245,7 +373,7 @@ export function extractMetadataFromHtml(db, url, html = '', clientExtracted = nu
 
   // Layer 2: schema.org Product / Offer JSON-LD and Microdata
   if (html) {
-    const ldHits = extractJsonLdProduct(html);
+    const ldHits = extractJsonLdProduct(html, lowerHtml, tags);
     if (!result.title && ldHits.title) {
       result.title = ldHits.title;
       result.field_confidence.title = 0.94;
@@ -276,7 +404,7 @@ export function extractMetadataFromHtml(db, url, html = '', clientExtracted = nu
 
   // Layer 3: Open Graph and Product Meta Tags
   if (html) {
-    const ogHits = extractOpenGraph(html);
+    const ogHits = extractOpenGraph(tags);
     if (!result.title && ogHits.title) {
       result.title = ogHits.title;
       result.field_confidence.title = 0.86;
@@ -304,7 +432,7 @@ export function extractMetadataFromHtml(db, url, html = '', clientExtracted = nu
 
   // Layer 4: Heuristics (<h1> / <title>, visible $ price, largest/first product <img>, URL slug fallback)
   if (html) {
-    const heurHits = extractHeuristics(html);
+    const heurHits = extractHeuristics(html, lowerHtml, tags);
     if (!result.title && heurHits.title) {
       result.title = heurHits.title;
       result.field_confidence.title = 0.68;
@@ -373,162 +501,240 @@ export function extractMetadataFromHtml(db, url, html = '', clientExtracted = nu
   return result;
 }
 
-function applyRetailerAdapter(html, adapter) {
-  const hits = { title: null, price: null, image: null, variant: null };
+function confidence(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 && n <= 1 ? n : fallback;
+}
 
-  // Support data-adapter attributes or id/class matching in HTML
-  if (adapter.title_selector) {
-    hits.title = matchSelectorContent(html, adapter.title_selector);
+/** Keeps only known fields with numeric 0..1 scores. */
+export function cleanFieldConfidence(input) {
+  const out = {};
+  for (const key of ['title', 'image', 'price', 'store', 'variant']) {
+    out[key] = confidence(input?.[key], 1);
   }
-  if (adapter.price_selector) {
-    const rawPrice = matchSelectorContent(html, adapter.price_selector);
-    hits.price = parsePriceNumber(rawPrice);
+  return out;
+}
+
+/**
+ * Everything below reads untrusted HTML. Two rules keep it linear-time:
+ * the page is tokenised once into tags with a bounded pattern, and block
+ * contents are located with indexOf rather than lazy [\s\S]*? spans.
+ */
+const TAG_RE = /<([a-zA-Z][a-zA-Z0-9]*)\b([^<>]{0,4000})>/g;
+const ATTR_RE = /([a-zA-Z_:][-a-zA-Z0-9_:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+))/g;
+const MAX_TAGS = 20000;
+
+function parseAttributes(raw) {
+  const attrs = {};
+  ATTR_RE.lastIndex = 0;
+  let m;
+  let guard = 0;
+  while ((m = ATTR_RE.exec(raw)) !== null && guard++ < 64) {
+    const name = m[1].toLowerCase();
+    if (!(name in attrs)) attrs[name] = m[2] ?? m[3] ?? m[4] ?? '';
   }
-  if (adapter.image_selector) {
-    hits.image = matchSelectorImage(html, adapter.image_selector);
+  return attrs;
+}
+
+/** One pass over the document: [{ name, attrs, end }] where end is the index after ">". */
+function tokenizeTags(html) {
+  const tags = [];
+  TAG_RE.lastIndex = 0;
+  let m;
+  while ((m = TAG_RE.exec(html)) !== null && tags.length < MAX_TAGS) {
+    tags.push({ name: m[1].toLowerCase(), attrs: parseAttributes(m[2]), end: TAG_RE.lastIndex });
   }
-  if (adapter.variant_selector) {
-    hits.variant = matchSelectorContent(html, adapter.variant_selector);
+  return tags;
+}
+
+/** Text between a tag and the next "<", capped. */
+function textAfter(html, tag) {
+  const stop = html.indexOf('<', tag.end);
+  const raw = html.slice(tag.end, stop === -1 ? Math.min(html.length, tag.end + 500) : Math.min(stop, tag.end + 500));
+  return cleanText(raw, 300);
+}
+
+/** Inner content of the first <name>…</name> at or after the given tag, capped. */
+function blockContent(html, lowerHtml, tag, maxLength = 200000) {
+  const close = lowerHtml.indexOf(`</${tag.name}`, tag.end);
+  if (close === -1) return null;
+  return html.slice(tag.end, Math.min(close, tag.end + maxLength));
+}
+
+function selectorLeafMatcher(selectorPart) {
+  const tokens = selectorPart.trim().split(/\s+/);
+  const leaf = tokens[tokens.length - 1] || '';
+  if (leaf.startsWith('[') && leaf.endsWith(']')) {
+    const inner = leaf.slice(1, -1);
+    const eq = inner.indexOf('=');
+    const name = (eq === -1 ? inner : inner.slice(0, eq)).trim().toLowerCase();
+    const value = eq === -1 ? null : inner.slice(eq + 1).trim().replace(/^["']|["']$/g, '');
+    return (tag) => name in tag.attrs && (value === null || tag.attrs[name] === value);
   }
+  const idAt = leaf.indexOf('#');
+  if (idAt !== -1) {
+    const id = leaf.slice(idAt + 1).split('.')[0];
+    return (tag) => tag.attrs.id === id;
+  }
+  if (leaf.includes('.')) {
+    const cls = leaf.split('.').filter(Boolean).pop();
+    return (tag) => typeof tag.attrs.class === 'string' && tag.attrs.class.split(/\s+/).includes(cls);
+  }
+  return () => false;
+}
+
+function matchSelectorContent(html, tags, selector) {
+  for (const part of String(selector).split(',')) {
+    const matches = selectorLeafMatcher(part);
+    for (const tag of tags) {
+      if (!matches(tag)) continue;
+      const text = textAfter(html, tag);
+      if (text) return text;
+    }
+  }
+  return null;
+}
+
+function matchSelectorImage(tags, selector) {
+  for (const part of String(selector).split(',')) {
+    const matches = selectorLeafMatcher(part);
+    for (const tag of tags) {
+      if (tag.name === 'img' && matches(tag) && tag.attrs.src) return tag.attrs.src;
+    }
+  }
+  return null;
+}
+
+function applyRetailerAdapter(html, tags, adapter) {
+  const hits = { title: null, price: null, image: null, variant: null };
+  if (adapter.title_selector) hits.title = matchSelectorContent(html, tags, adapter.title_selector);
+  if (adapter.price_selector) hits.price = parsePriceNumber(matchSelectorContent(html, tags, adapter.price_selector));
+  if (adapter.image_selector) hits.image = matchSelectorImage(tags, adapter.image_selector);
+  if (adapter.variant_selector) hits.variant = matchSelectorContent(html, tags, adapter.variant_selector);
   return hits;
 }
 
-function matchSelectorContent(html, selector) {
-  for (const part of selector.split(',').map(s => s.trim())) {
-    const tokens = part.split(/\s+/);
-    const leaf = tokens[tokens.length - 1];
-    if (leaf.startsWith('#')) {
-      const id = escapeRegex(leaf.slice(1));
-      const re = new RegExp(`<[^>]+id=["']${id}["'][^>]*>([^<]+)<\\/`, 'i');
-      const m = html.match(re);
-      if (m && stripHtmlAndEscape(m[1])) return stripHtmlAndEscape(m[1]);
-    } else if (leaf.startsWith('.') || leaf.includes('.')) {
-      const cls = escapeRegex(leaf.split('.').pop());
-      const re = new RegExp(`<[^>]+class=["'][^"']*\\b${cls}\\b[^"']*["'][^>]*>([^<]+)<\\/`, 'i');
-      const m = html.match(re);
-      if (m && stripHtmlAndEscape(m[1])) return stripHtmlAndEscape(m[1]);
-    } else if (leaf.startsWith('[') && leaf.endsWith(']')) {
-      const attr = escapeRegex(leaf.slice(1, -1));
-      const re = new RegExp(`<[^>]+${attr}[^>]*>([^<]+)<\\/`, 'i');
-      const m = html.match(re);
-      if (m && stripHtmlAndEscape(m[1])) return stripHtmlAndEscape(m[1]);
-    }
-  }
-  return null;
-}
-
-function matchSelectorImage(html, selector) {
-  for (const part of selector.split(',').map(s => s.trim())) {
-    if (part.startsWith('#')) {
-      const id = escapeRegex(part.slice(1));
-      const re = new RegExp(`<img[^>]+id=["']${id}["'][^>]+src=["']([^"']+)["']`, 'i');
-      const m = html.match(re) || html.match(new RegExp(`<img[^>]+src=["']([^"']+)["'][^>]+id=["']${id}["']`, 'i'));
-      if (m) return m[1];
-    } else if (part.startsWith('.')) {
-      const cls = escapeRegex(part.slice(1));
-      const re = new RegExp(`<img[^>]+class=["'][^"']*\\b${cls}\\b[^"']*["'][^>]+src=["']([^"']+)["']`, 'i');
-      const m = html.match(re) || html.match(new RegExp(`<img[^>]+src=["']([^"']+)["'][^>]+class=["'][^"']*\\b${cls}\\b[^"']*["']`, 'i'));
-      if (m) return m[1];
-    }
-  }
-  return null;
-}
-
-function extractJsonLdProduct(html) {
+function extractJsonLdProduct(html, lowerHtml, tags) {
   const hits = { title: null, price: null, currency: null, image: null, variant: null, in_stock: undefined };
-  const scriptRegex = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
-  let match;
-  while ((match = scriptRegex.exec(html)) !== null) {
+  let blocks = 0;
+  for (const tag of tags) {
+    if (tag.name !== 'script' || String(tag.attrs.type || '').toLowerCase() !== 'application/ld+json') continue;
+    if (++blocks > 20) break;
+    const content = blockContent(html, lowerHtml, tag);
+    if (!content) continue;
     try {
-      const parsed = JSON.parse(match[1].trim());
-      const candidates = Array.isArray(parsed) ? parsed : (parsed['@graph'] ? parsed['@graph'] : [parsed]);
-      for (const node of candidates) {
+      const parsed = JSON.parse(content.trim());
+      const candidates = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.['@graph']) ? parsed['@graph'] : [parsed]);
+      for (const node of candidates.slice(0, 50)) {
         if (!node || typeof node !== 'object') continue;
         const type = Array.isArray(node['@type']) ? node['@type'].join(',') : String(node['@type'] || '');
-        if (/Product/i.test(type)) {
-          if (!hits.title && node.name) hits.title = stripHtmlAndEscape(node.name);
-          if (!hits.image && node.image) {
-            const img = Array.isArray(node.image) ? node.image[0] : node.image;
-            hits.image = typeof img === 'object' ? img.url || img.contentUrl : String(img);
+        if (!/Product/i.test(type)) continue;
+        if (!hits.title && node.name) hits.title = cleanText(node.name, 300);
+        if (!hits.image && node.image) {
+          const img = Array.isArray(node.image) ? node.image[0] : node.image;
+          const url = img && typeof img === 'object' ? (img.url || img.contentUrl) : img;
+          if (typeof url === 'string') hits.image = url;
+        }
+        if (!hits.variant && (node.color || node.size)) {
+          hits.variant = [node.color, node.size].filter(Boolean).map(v => cleanText(v, 100)).join(' / ');
+        }
+        const offers = Array.isArray(node.offers) ? node.offers[0] : node.offers;
+        if (offers && typeof offers === 'object') {
+          const p = offers.price ?? offers.lowPrice ?? offers.highPrice;
+          if (hits.price === null && p !== undefined) hits.price = parsePriceNumber(typeof p === 'number' ? p : String(p));
+          if (typeof offers.priceCurrency === 'string' && /^[A-Za-z]{3}$/.test(offers.priceCurrency)) {
+            hits.currency = offers.priceCurrency.toUpperCase();
           }
-          if (!hits.variant && (node.color || node.size)) {
-            hits.variant = [node.color, node.size].filter(Boolean).map(stripHtmlAndEscape).join(' / ');
-          }
-          const offers = Array.isArray(node.offers) ? node.offers[0] : node.offers;
-          if (offers && typeof offers === 'object') {
-            const p = offers.price ?? offers.lowPrice ?? offers.highPrice;
-            if (hits.price === null && p !== undefined) hits.price = parsePriceNumber(String(p));
-            if (offers.priceCurrency) hits.currency = String(offers.priceCurrency).toUpperCase();
-            if (offers.availability) {
-              hits.in_stock = !/OutOfStock|SoldOut|Discontinued/i.test(String(offers.availability));
-            }
+          if (offers.availability) {
+            hits.in_stock = !/OutOfStock|SoldOut|Discontinued/i.test(String(offers.availability));
           }
         }
       }
     } catch {
-      // ignore malformed JSON-LD blocks
+      // Malformed JSON-LD is common; ignore the block.
     }
   }
   return hits;
 }
 
-function extractOpenGraph(html) {
-  const hits = { title: null, price: null, currency: null, image: null, variant: null };
-  const getMeta = (names) => {
+function extractOpenGraph(tags) {
+  const meta = new Map();
+  for (const tag of tags) {
+    if (tag.name !== 'meta') continue;
+    const key = String(tag.attrs.property || tag.attrs.name || '').toLowerCase();
+    if (key && tag.attrs.content !== undefined && !meta.has(key)) meta.set(key, tag.attrs.content);
+  }
+  const first = (names, max = 300) => {
     for (const name of names) {
-      const esc = escapeRegex(name);
-      const re1 = new RegExp(`<meta[^>]+(?:property|name)=(["'])${esc}\\1[^>]+content=(["'])([\\s\\S]*?)\\2`, 'i');
-      const re2 = new RegExp(`<meta[^>]+content=(["'])([\\s\\S]*?)\\1[^>]+(?:property|name)=(["'])${esc}\\3`, 'i');
-      const m1 = html.match(re1);
-      if (m1 && m1[3]) return stripHtmlAndEscape(m1[3]);
-      const m2 = html.match(re2);
-      if (m2 && m2[2]) return stripHtmlAndEscape(m2[2]);
+      const value = cleanText(meta.get(name), max);
+      if (value) return value;
     }
     return null;
   };
 
-  hits.title = getMeta(['og:title', 'twitter:title', 'product:title']);
-  hits.image = getMeta(['og:image', 'og:image:secure_url', 'twitter:image']);
-  const rawPrice = getMeta(['product:price:amount', 'og:price:amount', 'twitter:data1']);
+  const hits = { title: null, price: null, currency: null, image: null, variant: null };
+  hits.title = first(['og:title', 'twitter:title', 'product:title']);
+  hits.image = first(['og:image', 'og:image:secure_url', 'twitter:image'], 2048);
+  const rawPrice = first(['product:price:amount', 'og:price:amount', 'twitter:data1']);
   if (rawPrice) hits.price = parsePriceNumber(rawPrice);
-  const rawCurr = getMeta(['product:price:currency', 'og:price:currency']);
-  if (rawCurr) hits.currency = rawCurr.toUpperCase();
-  hits.variant = getMeta(['product:color', 'product:size']);
+  const rawCurr = first(['product:price:currency', 'og:price:currency']);
+  if (rawCurr && /^[A-Za-z]{3}$/.test(rawCurr)) hits.currency = rawCurr.toUpperCase();
+  hits.variant = first(['product:color', 'product:size']);
   return hits;
 }
 
-function extractHeuristics(html) {
+function extractHeuristics(html, lowerHtml, tags) {
   const hits = { title: null, price: null, image: null, variant: null };
-  const h1Match = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
-  if (h1Match) hits.title = stripHtmlAndEscape(h1Match[1]);
+
+  const h1 = tags.find(t => t.name === 'h1');
+  if (h1) hits.title = cleanText(blockContent(html, lowerHtml, h1, 2000), 300) || null;
   if (!hits.title) {
-    const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-    if (titleMatch) hits.title = stripHtmlAndEscape(titleMatch[1].split(/\s+[|\-–—]\s+/)[0]);
+    const titleTag = tags.find(t => t.name === 'title');
+    const raw = titleTag ? blockContent(html, lowerHtml, titleTag, 2000) : null;
+    if (raw) hits.title = cleanText(raw.split(/\s+[|\-–—]\s+/)[0], 300) || null;
   }
 
-  const priceMatch = html.match(/\$\s?([0-9]{1,5}(?:,[0-9]{3})*(?:\.[0-9]{2})?)/);
-  if (priceMatch) {
-    hits.price = parsePriceNumber(priceMatch[1]);
-  }
+  const priceMatch = html.match(/\$\s?([0-9]{1,5}(?:,[0-9]{3}){0,3}(?:\.[0-9]{2})?)/);
+  if (priceMatch) hits.price = parsePriceNumber(priceMatch[1]);
 
-  const imgMatch = html.match(/<img[^>]+src=["'](https?:\/\/[^"']+\.(?:jpg|jpeg|png|webp)[^"']*)["']/i);
-  if (imgMatch) {
-    hits.image = imgMatch[1];
-  }
+  const img = tags.find(t => t.name === 'img' && /^https?:\/\/[^\s]+\.(?:jpg|jpeg|png|webp)(?:[?#]|$)/i.test(t.attrs.src || ''));
+  if (img) hits.image = img.attrs.src;
 
-  const variantMatch = html.match(/(?:Size|Color|Variant)\s*:\s*<[^>]+>([^<]{1,40})<\//i);
-  if (variantMatch) {
-    hits.variant = stripHtmlAndEscape(variantMatch[1]);
-  }
+  const label = html.match(/(?:Size|Color|Colour|Variant)\s*:\s*<[a-zA-Z][^<>]{0,200}>([^<]{1,40})</i);
+  if (label) hits.variant = cleanText(label[1], 100) || null;
   return hits;
 }
 
-export function parsePriceNumber(str) {
-  if (str === null || str === undefined) return null;
-  const cleaned = String(str).replace(/[^0-9.]/g, '');
-  if (!cleaned) return null;
-  const val = Number.parseFloat(cleaned);
-  return Number.isFinite(val) ? Math.round(val * 100) / 100 : null;
+/**
+ * Reads one price out of free text. Understands "1,299.00", "1.299,00",
+ * "1 299,00 €" and prefers the number next to a currency symbol. When a
+ * string holds several numbers ("$12.99 - $15.99") the first is used; digits
+ * from different numbers are never glued together.
+ */
+export function parsePriceNumber(input) {
+  if (input === null || input === undefined) return null;
+  if (typeof input === 'number') return cleanPrice(input);
+  const text = String(input).slice(0, 200);
+  const NUM = String.raw`\d{1,3}(?:[ \u00a0.,\u2019']\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,3})?`;
+  const nearSymbol = text.match(new RegExp(`[$€£¥]\\s*(${NUM})`)) || text.match(new RegExp(`(${NUM})\\s*(?:[$€£¥]|USD|EUR|GBP|CAD|AUD)`, 'i'));
+  const token = nearSymbol ? nearSymbol[1] : (text.match(new RegExp(NUM)) || [])[0];
+  if (!token) return null;
+
+  let digits = token.replace(/[ \u00a0\u2019']/g, '');
+  const lastComma = digits.lastIndexOf(',');
+  const lastDot = digits.lastIndexOf('.');
+  if (lastComma !== -1 && lastDot !== -1) {
+    // Both present: whichever comes last is the decimal separator.
+    const decimal = lastComma > lastDot ? ',' : '.';
+    const thousands = decimal === ',' ? '.' : ',';
+    digits = digits.split(thousands).join('').replace(decimal, '.');
+  } else if (lastComma !== -1) {
+    const decimals = digits.length - lastComma - 1;
+    digits = (digits.indexOf(',') === lastComma && decimals <= 2) ? digits.replace(',', '.') : digits.split(',').join('');
+  } else if (lastDot !== -1 && digits.indexOf('.') !== lastDot) {
+    digits = digits.split('.').join('');
+  }
+  return cleanPrice(Number(digits));
 }
 
 function formatStoreName(hostname) {
@@ -565,7 +771,7 @@ function formatStoreName(hostname) {
     adidas: 'Adidas',
     zappos: 'Zappos',
     potterybarn: 'Pottery Barn',
-     Barnesandnoble: 'Barnes & Noble'
+    barnesandnoble: 'Barnes & Noble'
   };
   return special[base.toLowerCase()] || (base.charAt(0).toUpperCase() + base.slice(1));
 }
@@ -586,10 +792,6 @@ function inferTitleFromUrl(url) {
   }
 }
 
-function escapeRegex(s) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 /**
  * Server-side URL capture entry point (Section 7 & Decision D3).
  * HARD RULE D3: Amazon is NEVER fetched server-side.
@@ -597,11 +799,14 @@ function escapeRegex(s) {
 export async function captureFromUrl(db, { url, htmlSnapshot = null, clientExtracted = null, pathType = 'paste' }) {
   const safety = checkUrlSafety(url);
   if (!safety.safe) {
-    throw new Error(`Security Block: ${safety.reason}`);
+    throw badRequest(`That link can't be used: ${safety.reason}`);
   }
 
-  const parsedUrl = new URL(url);
+  const parsedUrl = new URL(String(url).trim());
   const hostname = parsedUrl.hostname.toLowerCase().replace(/^www\./, '');
+  if (!['paste', 'extension', 'share', 'import'].includes(pathType)) pathType = 'paste';
+  if (clientExtracted !== null && (typeof clientExtracted !== 'object' || Array.isArray(clientExtracted))) clientExtracted = null;
+  if (htmlSnapshot !== null && typeof htmlSnapshot !== 'string') htmlSnapshot = null;
 
   if (db) {
     db.prepare('INSERT INTO analytics_events (id, event_name, properties, created_at) VALUES (?, ?, ?, ?)').run(
@@ -619,13 +824,14 @@ export async function captureFromUrl(db, { url, htmlSnapshot = null, clientExtra
       canonical_url: canonicalizeUrl(url),
       original_url: url,
       store: 'Amazon',
-      title: inferTitleFromUrl(url) || 'Amazon Item (Captured via URL - confirm details or use Hushlist Browser Extension)',
+      title: '',
       image: null,
       price: null,
       currency: 'USD',
       variant: null,
-      field_confidence: { title: 0.4, image: 0, price: 0, store: 1.0, variant: 0 },
-      notice: 'Per Amazon Conditions of Use (Decision D3), Hushlist never fetches Amazon pages server-side. Use the Hushlist Browser Extension on the Amazon product tab for 1-click full extraction, or confirm the fields below.'
+      field_confidence: { title: 0, image: 0, price: 0, store: 1.0, variant: 0 },
+      extraction_layers_used: {},
+      notice: 'Hushlist does not read Amazon pages from the server. Type the details here, or use the browser extension on the product page to fill them in.'
     };
   }
 
@@ -636,18 +842,23 @@ export async function captureFromUrl(db, { url, htmlSnapshot = null, clientExtra
  * IMP-1: Import a public Amazon list (or exported HTML/JSON payload) with re-sync support.
  * Returns a detailed report of imported, skipped (duplicates), and failed items.
  */
-export function importAmazonList(db, { listId, ownerId, amazonListUrl, itemsPayload = [] }) {
-  const list = db.prepare('SELECT * FROM lists WHERE id = ? AND owner_id = ?').get(listId, ownerId);
-  if (!list) {
-    throw new Error('Target list not found or unauthorized');
+const MAX_IMPORT_ITEMS = 200;
+
+export function importAmazonList(db, { listId, canEdit, amazonListUrl, itemsPayload = [] }) {
+  const list = db.prepare('SELECT * FROM lists WHERE id = ?').get(String(listId ?? ''));
+  if (!list) throw notFound('List not found');
+  if (!canEdit(list)) throw forbidden('You cannot add items to this list');
+  if (!Array.isArray(itemsPayload)) throw badRequest('Items must be a list');
+  if (itemsPayload.length > MAX_IMPORT_ITEMS) {
+    throw badRequest(`Import at most ${MAX_IMPORT_ITEMS} items at a time`);
   }
 
-  const existingItems = db.prepare("SELECT canonical_url, LOWER(title) as ltitle FROM items WHERE list_id = ? AND status = 'active'").all(listId);
+  const existingItems = db.prepare("SELECT canonical_url, LOWER(title) as ltitle FROM items WHERE list_id = ? AND status = 'active'").all(list.id);
   const existingUrls = new Set(existingItems.map(i => i.canonical_url).filter(Boolean));
   const existingTitles = new Set(existingItems.map(i => i.ltitle).filter(Boolean));
 
   const report = {
-    source_url: amazonListUrl || 'extension_import',
+    source_url: cleanText(amazonListUrl, 300) || 'pasted items',
     imported: [],
     skipped: [],
     failed: []
@@ -655,62 +866,68 @@ export function importAmazonList(db, { listId, ownerId, amazonListUrl, itemsPayl
 
   const now = new Date().toISOString();
 
-  for (const raw of itemsPayload) {
-    try {
-      if (!raw || (!raw.title && !raw.url)) {
-        report.failed.push({ raw, reason: 'Missing title and URL' });
-        continue;
-      }
-      const canonical = raw.url ? canonicalizeUrl(raw.url) : null;
-      const cleanTitle = stripHtmlAndEscape(raw.title || inferTitleFromUrl(raw.url || ''));
-      if (!cleanTitle) {
-        report.failed.push({ raw, reason: 'Could not extract product title' });
-        continue;
-      }
-      if ((canonical && existingUrls.has(canonical)) || existingTitles.has(cleanTitle.toLowerCase())) {
-        report.skipped.push({ title: cleanTitle, url: canonical, reason: 'Already on list (duplicate skipped on re-sync)' });
-        continue;
-      }
+  inTransaction(db, () => {
+    itemsPayload.forEach((raw, index) => {
+      const label = cleanText(raw?.title, 120) || `Row ${index + 1}`;
+      try {
+        if (!raw || typeof raw !== 'object' || (!raw.title && !raw.url)) {
+          report.failed.push({ title: label, reason: 'Missing title and link' });
+          return;
+        }
+        const canonical = raw.url ? canonicalizeUrl(raw.url) : null;
+        const cleanTitle = cleanText(raw.title || inferTitleFromUrl(canonical || ''), 300);
+        if (!cleanTitle) {
+          report.failed.push({ title: label, reason: 'Could not work out a title' });
+          return;
+        }
+        if ((canonical && existingUrls.has(canonical)) || existingTitles.has(cleanTitle.toLowerCase())) {
+          report.skipped.push({ title: cleanTitle, reason: 'Already on this list' });
+          return;
+        }
 
-      const itemId = uid('itm');
-      const price = parsePriceNumber(raw.price);
-      const confidence = {
-        title: 0.95,
-        image: raw.image ? 0.95 : 0,
-        price: price !== null ? 0.95 : 0,
-        store: 1.0,
-        variant: raw.variant ? 0.9 : 0
-      };
+        const itemId = uid('itm');
+        const price = cleanPrice(typeof raw.price === 'string' ? parsePriceNumber(raw.price) : raw.price);
+        const fromAmazon = canonical ? isAmazonDomain(new URL(canonical).hostname) : true;
+        const itemConfidence = {
+          title: 0.95,
+          image: 0,
+          price: price !== null ? 0.95 : 0,
+          store: fromAmazon ? 1.0 : 0.85,
+          variant: raw.variant ? 0.9 : 0
+        };
 
-      db.prepare(`
-        INSERT INTO items (
-          id, list_id, kind, title, canonical_url, original_url, store, image, price, currency,
-          variant, qty_wanted, priority, notes, field_confidence, created_at, updated_at
-        ) VALUES (?, ?, 'product', ?, ?, ?, 'Amazon', ?, ?, 'USD', ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        itemId,
-        listId,
-        cleanTitle,
-        canonical,
-        raw.url || canonical,
-        raw.image ? toProxiedImageUrl(raw.image) : null,
-        price,
-        raw.variant ? stripHtmlAndEscape(raw.variant) : null,
-        Number(raw.qty_wanted) > 0 ? Number(raw.qty_wanted) : 1,
-        raw.priority || 'normal',
-        raw.notes ? stripHtmlAndEscape(raw.notes) : 'Imported from Amazon List',
-        JSON.stringify(confidence),
-        now,
-        now
-      );
+        db.prepare(`
+          INSERT INTO items (
+            id, list_id, kind, title, canonical_url, original_url, store, image, price, currency,
+            variant, qty_wanted, priority, notes, field_confidence, created_at, updated_at
+          ) VALUES (?, ?, 'product', ?, ?, ?, ?, ?, ?, 'USD', ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          itemId,
+          list.id,
+          cleanTitle,
+          canonical,
+          canonical,
+          fromAmazon ? 'Amazon' : formatStoreName(new URL(canonical).hostname),
+          toProxiedImageUrl(raw.image),
+          price,
+          cleanText(raw.variant, 200) || null,
+          cleanInt(raw.qty_wanted, 1, 999, 1),
+          ['most_wanted', 'high', 'normal', 'low'].includes(raw.priority) ? raw.priority : 'normal',
+          cleanText(raw.notes, 2000) || null,
+          JSON.stringify(itemConfidence),
+          now,
+          now
+        );
 
-      if (canonical) existingUrls.add(canonical);
-      existingTitles.add(cleanTitle.toLowerCase());
-      report.imported.push({ id: itemId, title: cleanTitle, price, url: canonical });
-    } catch (err) {
-      report.failed.push({ raw, reason: err.message });
-    }
-  }
+        if (canonical) existingUrls.add(canonical);
+        existingTitles.add(cleanTitle.toLowerCase());
+        report.imported.push({ id: itemId, title: cleanTitle, price });
+      } catch (err) {
+        if (!(err instanceof AppError)) throw err;
+        report.failed.push({ title: label, reason: err.message });
+      }
+    });
+  });
 
   return report;
 }
@@ -724,26 +941,27 @@ export function importAmazonList(db, { listId, ownerId, amazonListUrl, itemsPayl
  */
 export function recheckItemPriceAndStock(db, { itemId, newPrice, newInStock = true, sendNotificationFn = null }) {
   const item = db.prepare("SELECT * FROM items WHERE id = ? AND status = 'active'").get(itemId);
-  if (!item) throw new Error('Active item not found');
-
-  if (item.canonical_url) {
-    try {
-      const host = new URL(item.canonical_url).hostname.toLowerCase();
-      if (isAmazonDomain(host)) {
-        throw new Error('Decision D3 Policy: Amazon items are excluded from server-side price re-checks');
-      }
-    } catch (err) {
-      if (err.message.includes('Decision D3')) throw err;
-    }
-  }
+  if (!item) throw notFound('Item not found');
 
   const nowIso = new Date().toISOString();
-  const parsedPrice = newPrice !== undefined && newPrice !== null ? parsePriceNumber(newPrice) : item.price;
+  const cleaned = newPrice !== undefined && newPrice !== null && newPrice !== '' ? cleanPrice(newPrice) : item.price;
+  if (newPrice !== undefined && newPrice !== null && newPrice !== '' && cleaned === null) {
+    throw badRequest('Enter a valid price');
+  }
+  const parsedPrice = cleaned;
   const inStockFlag = newInStock ? 1 : 0;
 
   const oldPrice = item.price;
   const oldInStock = item.in_stock;
 
+  // Items that pre-date price tracking have no starting point; record the
+  // price they had so the history (and any drop) is measured from it.
+  const hasHistory = db.prepare('SELECT 1 FROM price_snapshots WHERE item_id = ? LIMIT 1').get(item.id);
+  if (!hasHistory && oldPrice !== null) {
+    db.prepare('INSERT INTO price_snapshots (id, item_id, price, in_stock, checked_at) VALUES (?, ?, ?, ?, ?)').run(
+      uid('ps'), item.id, oldPrice, oldInStock, item.created_at
+    );
+  }
   db.prepare('INSERT INTO price_snapshots (id, item_id, price, in_stock, checked_at) VALUES (?, ?, ?, ?, ?)').run(
     uid('ps'), item.id, parsedPrice, inStockFlag, nowIso
   );
@@ -764,7 +982,6 @@ export function recheckItemPriceAndStock(db, { itemId, newPrice, newInStock = tr
     WHERE item_id = ? AND status IN ('reserved', 'purchased') AND verified = 1
   `).all(item.id);
 
-  let claimersNotified = 0;
   if (sendNotificationFn && (isSignificantDrop || wentOutOfStock)) {
     for (const c of activeClaims) {
       if (isSignificantDrop) {
@@ -776,7 +993,6 @@ export function recheckItemPriceAndStock(db, { itemId, newPrice, newInStock = tr
           subject: `Price drop (${dropPct}% off) on "${item.title}"!`,
           body: `Good news! An item you claimed ("${item.title}") dropped from $${Number(oldPrice).toFixed(2)} to $${Number(parsedPrice).toFixed(2)} (-${dropPct}%).`
         });
-        claimersNotified++;
       }
       if (wentOutOfStock) {
         sendNotificationFn(db, {
@@ -787,7 +1003,6 @@ export function recheckItemPriceAndStock(db, { itemId, newPrice, newInStock = tr
           subject: `Out-of-stock alert for "${item.title}"`,
           body: `"${item.title}" appears to be out of stock at ${item.store || 'the retailer'}. Your reservation is kept until expiry.`
         });
-        claimersNotified++;
       }
     }
   }
@@ -812,6 +1027,8 @@ export function recheckItemPriceAndStock(db, { itemId, newPrice, newInStock = tr
     );
   }
 
+  // Nothing derived from claims may be returned: the caller is usually the
+  // list owner, and "N people were notified" would reveal that the item is taken.
   return {
     item_id: item.id,
     old_price: oldPrice,
@@ -819,7 +1036,6 @@ export function recheckItemPriceAndStock(db, { itemId, newPrice, newInStock = tr
     drop_percent: dropPct,
     significant_drop_alert: isSignificantDrop,
     back_in_stock_alert: backInStock,
-    out_of_stock_alert: wentOutOfStock,
-    claimers_notified: claimersNotified
+    out_of_stock_alert: wentOutOfStock
   };
 }
