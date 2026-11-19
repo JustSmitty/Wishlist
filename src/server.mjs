@@ -2,7 +2,7 @@ import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createDatabase, uid, secretToken, sha256, safeEqual, inTransaction } from './db/schema.mjs';
+import { createDatabase, uid, secretToken, signInCode, sha256, safeEqual, inTransaction } from './db/schema.mjs';
 import { seedRetailerAdapters, seedDemoData } from './db/seed.mjs';
 import { loadConfig } from './config.mjs';
 import { AppError, badRequest, unauthorized, forbidden, notFound, conflict, tooMany } from './errors.mjs';
@@ -29,12 +29,12 @@ import {
 } from './services/google.mjs';
 import {
   publicSelf, createSession, resolveSession, destroySession, revokeApiTokens, countApiTokens,
-  startSignIn, completeSignIn, joinGroupByInvite, syncAdmins, purgeExpiredAuth, signInVerifiedEmail
+  startSignIn, completeSignIn, joinGroupByInvite, syncAdmins, purgeExpiredAuth, signInVerifiedEmail, rememberDevice
 } from './services/auth.mjs';
 import { deleteAccount } from './services/account.mjs';
 import {
   getActiveUser, isGuardianOf, isGroupMember, isGroupOrganizer, isBlockedBy, eitherBlocked, inSameCircle,
-  hasApprovedFollow, sharesGroup, canNameAsCollaborator, blockUser, unblockUser, removeCoOwner
+  hasApprovedFollow, sharesGroup, canNameAsCollaborator, blockUser, unblockUser, removeCoOwner, connectingCircles
 } from './services/access.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -125,8 +125,8 @@ export function createApp(customDb = null, options = {}) {
     purgeExpiredClaims(db);
   }
 
-  function listDetail(list, viewerId, guestToken = null) {
-    return formatListResponse(db, list, viewerId, guestToken);
+  function listDetail(list, viewerId, guestToken = null, options = {}) {
+    return formatListResponse(db, list, viewerId, guestToken, options);
   }
 
   async function route(req, res) {
@@ -175,6 +175,13 @@ export function createApp(customDb = null, options = {}) {
     const cookieSession = isApi && !bearer ? resolveSession(db, cookieToken, 'web') : null;
     const currentUser = (bearerSession || cookieSession)?.user || null;
     const viaCookie = Boolean(cookieSession);
+    const deviceToken = parseCookies(req.headers.cookie).hl_device || null;
+    // Set after any successful sign-in, so this browser is recognised next time.
+    const deviceCookie = (userId) => {
+      const remembered = rememberDevice(db, userId, deviceToken);
+      return [`hl_device=${remembered.token}`, 'Path=/api/auth', 'HttpOnly', 'SameSite=Lax', `Max-Age=${remembered.maxAgeSeconds}`,
+        ...(config.secureCookies ? ['Secure'] : [])].join('; ');
+    };
 
     // An extension token exists to add wishes. It can list the lists to
     // choose from, read a product link and add an item — nothing else.
@@ -291,7 +298,7 @@ export function createApp(customDb = null, options = {}) {
     if (pathname === '/api/auth/start' && method === 'POST') {
       limit(req, 'auth-start', 10);
       const b = await body();
-      const started = startSignIn(db, { email: b.email, requester: clientIp(req) });
+      const started = startSignIn(db, { email: b.email, requester: clientIp(req), deviceToken });
       return sendJson(res, 200, {
         challenge_id: started.challenge_id,
         expires_in_minutes: started.expires_in_minutes,
@@ -320,7 +327,7 @@ export function createApp(customDb = null, options = {}) {
         current_user: publicSelf(result.user),
         created: result.created,
         joined_group: result.joined_group
-      }, { 'Set-Cookie': sessionCookie(session.token, session.maxAgeSeconds, { secure: config.secureCookies }) });
+      }, { 'Set-Cookie': [sessionCookie(session.token, session.maxAgeSeconds, { secure: config.secureCookies }), deviceCookie(result.user.id)] });
     }
 
     // ----- Sign in with Google ---------------------------------------------
@@ -397,7 +404,8 @@ export function createApp(customDb = null, options = {}) {
       const session = createSession(db, outcome.user.id);
       return redirect(outcome.returnTo || '/', [
         clearState,
-        sessionCookie(session.token, session.maxAgeSeconds, { secure: config.secureCookies })
+        sessionCookie(session.token, session.maxAgeSeconds, { secure: config.secureCookies }),
+        deviceCookie(outcome.user.id)
       ]);
     }
 
@@ -535,8 +543,18 @@ export function createApp(customDb = null, options = {}) {
            OR l.owner_id IN (SELECT dependent_id FROM guardian_links WHERE guardian_id = ?)
         ORDER BY l.archived_at IS NOT NULL ASC, l.created_at ASC
       `).all(currentUser.id, `%"${currentUser.id}"%`, currentUser.id);
-      const lists = rows.map(l => listDetail(l, currentUser.id)).filter(l => l && l.can_edit);
-      return sendJson(res, 200, { lists });
+      const lists = rows.map(l => listDetail(l, currentUser.id, null, { summary: true })).filter(l => l && l.can_edit);
+      // Lists someone has asked this person to co-own, waiting for an answer.
+      const invitations = db.prepare(`
+        SELECT li.list_id, li.created_at, l.name AS list_name, o.name AS owner_name, inv.name AS invited_by_name
+        FROM list_invites li
+        JOIN lists l ON l.id = li.list_id
+        JOIN users o ON o.id = l.owner_id AND o.status = 'active'
+        JOIN users inv ON inv.id = li.invited_by AND inv.status = 'active'
+        WHERE li.user_id = ? AND l.archived_at IS NULL
+        ORDER BY li.created_at DESC LIMIT 50
+      `).all(currentUser.id);
+      return sendJson(res, 200, { lists, invitations });
     }
 
     if (pathname === '/api/lists' && method === 'POST') {
@@ -579,7 +597,7 @@ export function createApp(customDb = null, options = {}) {
             visibility, surprise_mode, share_token, guest_claim_cap, claim_expiry_days, created_at
           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
-          id, ownerId, JSON.stringify(coOwnerIds), name,
+          id, ownerId, '[]', name,
           cleanText(b.occasion, 40) || 'Birthday', eventDate, visibility,
           b.surprise_mode === false ? 0 : 1, secretToken('shr'),
           cleanInt(b.guest_claim_cap, 1, 20, 3), cleanInt(b.claim_expiry_days, 1, 60, 7), nowIso
@@ -590,7 +608,7 @@ export function createApp(customDb = null, options = {}) {
         `);
         if (helperId) share.run(uid('shr'), id, 'user', helperId, 'helper', nowIso);
         for (const gid of groupIds) share.run(uid('shr'), id, 'group', gid, 'viewer', nowIso);
-        notifyNamed(db, user, name, coOwnerIds, 'a co-owner');
+        inviteCoOwners(db, user, { id, name }, coOwnerIds);
         notifyNamed(db, user, name, helperId ? [helperId] : [], 'the helper');
         return id;
       });
@@ -617,6 +635,27 @@ export function createApp(customDb = null, options = {}) {
       const b = await body();
       const nowIso = new Date().toISOString();
       const today = nowIso.slice(0, 10);
+
+      // Answering an invitation to co-own needs no edit rights either.
+      if (b.action === 'accept_invite' || b.action === 'decline_invite') {
+        const invite = db.prepare('SELECT * FROM list_invites WHERE list_id = ? AND user_id = ?').get(list.id, user.id);
+        if (!invite) throw notFound('List not found');
+        db.prepare('DELETE FROM list_invites WHERE list_id = ? AND user_id = ?').run(list.id, user.id);
+        if (b.action === 'decline_invite') return sendJson(res, 200, { declined: true });
+        // Checked again now: the invitation may have become stale since it was sent.
+        const inviterStillDecides = invite.invited_by === list.owner_id || isGuardianOf(db, invite.invited_by, list.owner_id);
+        const anchor = invite.invited_by;
+        if (list.archived_at || !inviterStillDecides || !canNameAsCollaborator(db, anchor, user.id)) {
+          throw conflict('That invitation is no longer valid');
+        }
+        const current = safeJsonParse(list.co_owner_ids, []);
+        if (!current.includes(user.id)) {
+          if (current.length >= 5) throw conflict('This list already has as many co-owners as it can');
+          db.prepare('UPDATE lists SET co_owner_ids = ? WHERE id = ?').run(JSON.stringify([...current, user.id]), list.id);
+          db.prepare("DELETE FROM list_shares WHERE list_id = ? AND grantee_type = 'user' AND grantee_id = ? AND permission = 'helper'").run(list.id, user.id);
+        }
+        return sendJson(res, 200, { list: listDetail(getList(list.id), user.id) });
+      }
 
       // Stepping away from a list you were named on needs no edit rights.
       if (b.action === 'leave') {
@@ -715,6 +754,16 @@ export function createApp(customDb = null, options = {}) {
       if (b.visibility !== undefined && b.visibility !== list.visibility) {
         if (!VISIBILITIES.includes(b.visibility)) throw badRequest('Unknown visibility');
         if (!ownerLevel) throw forbidden('Only the list owner can change who sees it');
+        // Opening a surprise list to anyone with a link, once it has wishes,
+        // would let its owner open that link signed out and see which wishes
+        // are taken. Like switching surprise mode off, it is refused for every
+        // list with wishes, whether or not anything has been reserved.
+        if (sealed && b.visibility === 'link') {
+          const items = db.prepare("SELECT COUNT(*) AS n FROM items WHERE list_id = ? AND status IN ('active', 'received')").get(list.id).n;
+          if (items > 0) {
+            throw conflict('A surprise list that already has wishes cannot be opened to anyone with the link. Share it with a circle, or start a new list for link sharing.', { code: 'link_locked' });
+          }
+        }
         updates.visibility = b.visibility;
         // Taking a list off link sharing retires the old link for good.
         if (list.visibility === 'link') updates.share_token = secretToken('shr');
@@ -787,8 +836,12 @@ export function createApp(customDb = null, options = {}) {
           }
         }
         if (nextCoOwners) {
-          db.prepare('UPDATE lists SET co_owner_ids = ? WHERE id = ?').run(JSON.stringify(nextCoOwners), list.id);
-          notifyNamed(db, user, list.name, nextCoOwners.filter(id => !currentCoOwners.includes(id)), 'a co-owner');
+          // People already co-owning stay if they are still wanted; anyone new
+          // is invited, and becomes a co-owner only by accepting.
+          db.prepare('UPDATE lists SET co_owner_ids = ? WHERE id = ?').run(JSON.stringify(currentCoOwners.filter(id => nextCoOwners.includes(id))), list.id);
+          const pending = db.prepare('SELECT user_id FROM list_invites WHERE list_id = ?').all(list.id).map(r => r.user_id);
+          for (const id of pending) if (!nextCoOwners.includes(id)) db.prepare('DELETE FROM list_invites WHERE list_id = ? AND user_id = ?').run(list.id, id);
+          inviteCoOwners(db, user, list, nextCoOwners.filter(id => !currentCoOwners.includes(id) && !pending.includes(id)));
         }
         if (nextGroups) {
           db.prepare("DELETE FROM list_shares WHERE list_id = ? AND grantee_type = 'group'").run(list.id);
@@ -1104,6 +1157,75 @@ export function createApp(customDb = null, options = {}) {
       });
     }
 
+    // A guest who reserved by link, but no longer has the browser that did,
+    // can get their reservations back by proving the address again. The
+    // answer is the same whether or not that address has reserved anything.
+    if (pathname === '/api/claims/recover' && method === 'POST') {
+      limit(req, 'recover', 10);
+      const b = await body();
+      const email = typeof b.email === 'string' ? b.email.trim().toLowerCase().slice(0, 254) : '';
+      if (!/^[^\s@\x00-\x1f\x7f]+@[^\s@\x00-\x1f\x7f]+\.[^\s@\x00-\x1f\x7f]+$/.test(email)) throw badRequest('Enter the email address you reserved with');
+      if (!limiter.allow(`recover:${clientIp(req)}:${email}`, 3, 15 * 60_000) || !limiter.allow(`recover-address:${email}`, 6, 60 * 60_000)) {
+        throw tooMany('Too many requests for this address. Try again later.');
+      }
+      const key = typeof b.list === 'string' ? b.list.slice(0, 200) : '';
+      const list = key ? db.prepare('SELECT * FROM lists WHERE share_token = ?').get(key) : null;
+      const id = secretToken('rcv');
+      const code = signInCode();
+      const nowIso = new Date().toISOString();
+      if (list && getViewerRole(db, list, null).canView) {
+        const held = db.prepare(`
+          SELECT COUNT(*) AS n FROM claims
+          WHERE list_id = ? AND claimer_user_id IS NULL AND verified = 1 AND LOWER(guest_email) = ?
+            AND status IN ('reserved', 'purchased', 'given')
+        `).get(list.id, email).n;
+        db.prepare(`
+          INSERT INTO claim_recoveries (id, email, list_id, code_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?)
+        `).run(id, email, list.id, sha256(`${id}:${code}`), new Date(Date.now() + 30 * 60_000).toISOString(), nowIso);
+        sendNotification(db, {
+          recipientEmail: email,
+          eventType: 'guest_verification_code',
+          subject: held ? 'Your Hushlist code' : 'About your Hushlist request',
+          body: held
+            ? `Enter ${code} within 30 minutes to manage the reservation you made with this address. If you did not ask for this, ignore this message.`
+            : 'Someone asked to manage reservations made with this address, but there are none on that list. If it was not you, ignore this message.',
+          storedBody: 'A code to manage a reservation was requested.'
+        });
+      }
+      return sendJson(res, 200, {
+        recovery_id: id,
+        expires_in_minutes: 30,
+        ...(config.demoMode && list ? { demo_code: code } : {})
+      });
+    }
+
+    if (pathname === '/api/claims/recover/verify' && method === 'POST') {
+      limit(req, 'recover-verify', 20);
+      const b = await body();
+      const row = db.prepare('SELECT * FROM claim_recoveries WHERE id = ?').get(String(b.recovery_id ?? '').slice(0, 100));
+      const refused = () => badRequest('That code is not right, or it has expired. Ask for a new one.');
+      if (!row || row.used_at || row.expires_at <= new Date().toISOString() || row.attempts >= 5) throw refused();
+      if (!safeEqual(row.code_hash, sha256(`${row.id}:${String(b.code ?? '').trim()}`))) {
+        db.prepare('UPDATE claim_recoveries SET attempts = attempts + 1 WHERE id = ?').run(row.id);
+        throw refused();
+      }
+      // New manage tokens: whatever browser held the old ones no longer can.
+      const tokens = inTransaction(db, () => {
+        db.prepare('UPDATE claim_recoveries SET used_at = ? WHERE id = ?').run(new Date().toISOString(), row.id);
+        const claims = db.prepare(`
+          SELECT id FROM claims
+          WHERE list_id = ? AND claimer_user_id IS NULL AND verified = 1 AND LOWER(guest_email) = ?
+            AND status IN ('reserved', 'purchased', 'given')
+        `).all(row.list_id, row.email);
+        return claims.map(c => {
+          const token = secretToken('mng');
+          db.prepare('UPDATE claims SET manage_token = ?, updated_at = ? WHERE id = ?').run(token, new Date().toISOString(), c.id);
+          return token;
+        });
+      });
+      return sendJson(res, 200, { manage_tokens: tokens });
+    }
+
     if (pathname === '/api/claims/verify' && method === 'POST') {
       limit(req, 'verify', 25);
       const b = await body();
@@ -1279,20 +1401,27 @@ export function createApp(customDb = null, options = {}) {
           const budgets = db.prepare('SELECT * FROM budgets WHERE owner_id = ? AND subject_user_id = ? ORDER BY created_at DESC').all(user.id, person.id);
           const budget = budgets.find(bd => nextOccasion && bd.occasion === nextOccasion.kind) || budgets[0] || null;
 
-          // Secret ideas are shared within a circle. Following someone is not
-          // enough, and the person they are about never sees them (they are
-          // not in their own "people" list, and this checks again).
-          const secretIdeas = (person.id !== user.id && inSameCircle(db, user.id, person.id))
+          // Secret ideas belong to one circle each. A viewer sees the ideas
+          // of the circles that connect them to this person, plus any of
+          // their own ideas that are not yet in a circle. The person an idea
+          // is about never sees it (they are not in their own "people" list).
+          const circles = connectingCircles(db, user.id, person.id);
+          const circleIds = circles.map(c => c.id);
+          const marks = circleIds.map(() => '?').join(',') || "''";
+          const secretIdeas = circles.length
             ? db.prepare(`
-                SELECT si.id, si.title, si.url, si.estimated_price, si.note, si.author_id, si.created_at, u.name AS author_name
+                SELECT si.id, si.title, si.url, si.estimated_price, si.note, si.author_id, si.created_at, si.group_id,
+                       u.name AS author_name, g.name AS group_name
                 FROM secret_ideas si
                 JOIN users u ON u.id = si.author_id
-                WHERE si.subject_user_id = ?
+                LEFT JOIN groups g ON g.id = si.group_id
+                WHERE si.subject_user_id = ? AND (si.group_id IN (${marks}) OR (si.group_id IS NULL AND si.author_id = ?))
                 ORDER BY si.created_at DESC
                 LIMIT 50
-              `).all(person.id).map(si => ({
+              `).all(person.id, ...circleIds, user.id).map(si => ({
                 id: si.id, title: si.title, url: si.url, estimated_price: si.estimated_price, note: si.note,
-                author_name: si.author_name, is_mine: si.author_id === user.id, created_at: si.created_at
+                author_name: si.author_name, is_mine: si.author_id === user.id, created_at: si.created_at,
+                circle: si.group_id ? { id: si.group_id, name: si.group_name } : null
               }))
             : null;
 
@@ -1315,6 +1444,7 @@ export function createApp(customDb = null, options = {}) {
               over_budget: budget ? spent > budget.amount : false
             },
             can_share_secret_ideas: secretIdeas !== null,
+            secret_idea_circles: circles,
             secret_ideas: secretIdeas || []
           };
         });
@@ -1359,26 +1489,46 @@ export function createApp(customDb = null, options = {}) {
       limit(req, 'secret-ideas', 30);
       const b = await body();
       const subject = getActiveUser(db, b.subject_user_id);
-      if (!subject || subject.id === user.id || !inSameCircle(db, user.id, subject.id)) {
+      const circles = subject ? connectingCircles(db, user.id, subject.id) : [];
+      if (!subject || subject.id === user.id || circles.length === 0) {
         throw forbidden('Secret ideas can only be shared about someone in one of your circles');
       }
+      // Which circle sees it is the author's choice. With only one possible
+      // circle there is nothing to choose.
+      const groupId = typeof b.group_id === 'string' ? b.group_id : (circles.length === 1 ? circles[0].id : null);
+      if (!groupId) throw badRequest('Choose which circle can see this idea');
+      if (!circles.some(c => c.id === groupId)) throw forbidden('Choose one of the circles you share with them');
       const title = cleanText(b.title, 200);
       if (!title) throw badRequest('Describe the idea');
       const id = uid('sec');
       db.prepare(`
-        INSERT INTO secret_ideas (id, subject_user_id, author_id, title, url, estimated_price, note, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO secret_ideas (id, subject_user_id, author_id, title, url, estimated_price, note, created_at, group_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         id, subject.id, user.id, title,
         b.url ? canonicalizeUrl(b.url) : null,
         cleanPrice(b.estimated_price),
         cleanText(b.note, 500) || null,
-        new Date().toISOString()
+        new Date().toISOString(),
+        groupId
       );
-      return sendJson(res, 201, { secret_idea: { id, title } });
+      return sendJson(res, 201, { secret_idea: { id, title, group_id: groupId } });
     }
 
     const secretMatch = pathname.match(/^\/api\/secret-ideas\/([^/]{1,100})$/);
+    // The author can move an idea to another circle (or give an older idea,
+    // which only they can see, its first circle).
+    if (secretMatch && method === 'PATCH') {
+      const user = requireUser();
+      const row = db.prepare('SELECT * FROM secret_ideas WHERE id = ?').get(decodeSegment(secretMatch[1]));
+      if (!row || row.author_id !== user.id) throw notFound('Idea not found');
+      const b = await body();
+      if (!connectingCircles(db, user.id, row.subject_user_id).some(c => c.id === b.group_id)) {
+        throw forbidden('Choose one of the circles you share with them');
+      }
+      db.prepare('UPDATE secret_ideas SET group_id = ? WHERE id = ?').run(b.group_id, row.id);
+      return sendJson(res, 200, { secret_idea: { id: row.id, group_id: b.group_id } });
+    }
     if (secretMatch && method === 'DELETE') {
       const user = requireUser();
       const row = db.prepare('SELECT * FROM secret_ideas WHERE id = ?').get(decodeSegment(secretMatch[1]));
@@ -2007,6 +2157,21 @@ function newInviteCode() {
   return `${code.slice(0, 4)}-${code.slice(4, 8)}-${code.slice(8)}`;
 }
 
+/** Invites people to co-own a list. Nothing changes for them until they accept. */
+function inviteCoOwners(db, actor, list, userIds) {
+  const nowIso = new Date().toISOString();
+  for (const id of userIds) {
+    db.prepare('INSERT OR IGNORE INTO list_invites (list_id, user_id, invited_by, created_at) VALUES (?, ?, ?, ?)').run(list.id, id, actor.id, nowIso);
+    sendNotification(db, {
+      recipientUserId: id,
+      aboutUserId: actor.id,
+      eventType: 'added_to_list',
+      subject: 'You were invited to co-own a wishlist',
+      body: `${actor.name} would like you to co-own "${list.name}". As a co-owner you could add and edit its wishes, and, like its owner, you would not see what has been reserved while it is a surprise. Accept or decline from My lists.`
+    });
+  }
+}
+
 /** Tells people they were named on a list, so it never happens silently. */
 function notifyNamed(db, actor, listName, userIds, role) {
   for (const id of userIds) {
@@ -2084,12 +2249,15 @@ function publicFollow(f) {
   return { id: f.id, target_type: f.target_type, target_id: f.target_id, status: f.status, created_at: f.created_at };
 }
 
-function formatListResponse(db, list, viewerUserId = null, guestClaimToken = null) {
+function formatListResponse(db, list, viewerUserId = null, guestClaimToken = null, { summary = false } = {}) {
   const viewerCtx = getViewerRole(db, list, viewerUserId, guestClaimToken);
   if (!viewerCtx.canView) return null;
 
   const owner = db.prepare('SELECT id, name, is_dependent FROM users WHERE id = ?').get(list.owner_id);
-  const rawItems = db.prepare(`
+  // A summary carries the list's details and how many wishes it has, but not
+  // the wishes themselves: the index of someone's lists stays small however
+  // many lists and wishes they have.
+  const rawItems = summary ? [] : db.prepare(`
     SELECT * FROM items
     WHERE list_id = ? AND status IN ('active', 'received')
     ORDER BY
@@ -2116,7 +2284,10 @@ function formatListResponse(db, list, viewerUserId = null, guestClaimToken = nul
     can_edit: Boolean(viewerCtx.canEdit),
     can_see_claims: Boolean(viewerCtx.canSeeClaims),
     can_release_claims: Boolean(viewerCtx.canReleaseClaims),
-    items: rawItems.map(item => sanitizeItemForViewer(db, item, list, viewerCtx, viewerUserId))
+    items: rawItems.map(item => sanitizeItemForViewer(db, item, list, viewerCtx, viewerUserId)),
+    item_count: summary
+      ? db.prepare("SELECT COUNT(*) AS n FROM items WHERE list_id = ? AND status = 'active'").get(list.id).n
+      : rawItems.filter(i => i.status === 'active').length
   };
 
   // The share link is for people who manage the list, or lists that are
@@ -2135,6 +2306,10 @@ function formatListResponse(db, list, viewerUserId = null, guestClaimToken = nul
       .map(id => db.prepare("SELECT id, name FROM users WHERE id = ? AND status = 'active'").get(id))
       .filter(Boolean);
     response.co_owner_ids = coOwnerIds;
+    response.pending_co_owners = db.prepare(`
+      SELECT u.id, u.name FROM list_invites li JOIN users u ON u.id = li.user_id
+      WHERE li.list_id = ? AND u.status = 'active'
+    `).all(list.id);
     response.guest_claim_cap = list.guest_claim_cap;
     response.claim_expiry_days = list.claim_expiry_days;
     response.reveal_unlocks_on = revealUnlockDate(list);

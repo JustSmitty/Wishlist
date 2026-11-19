@@ -85,6 +85,7 @@ export function blockUser(db, blockerId, blockedId) {
       WHERE grantee_type = 'user' AND grantee_id = ? AND list_id IN (SELECT id FROM lists WHERE owner_id = ?)
     `).run(other, owner);
     removeCoOwner(db, owner, other);
+    db.prepare('DELETE FROM list_invites WHERE user_id = ? AND list_id IN (SELECT id FROM lists WHERE owner_id = ?)').run(other, owner);
   }
 }
 
@@ -130,6 +131,24 @@ export function inSameCircle(db, viewerId, subjectId) {
     JOIN group_members me ON me.group_id = g.group_id
     WHERE gl.dependent_id = ? AND me.user_id = ?
   `).get(subjectId, viewerId));
+}
+
+/**
+ * Circles that connect `viewerId` to `subjectId`: circles both are in, or —
+ * for a child, who is in no circle — circles the viewer shares with one of
+ * the child's guardians (or a guardian's own circles, for the guardian).
+ * Empty when the subject has blocked the viewer.
+ */
+export function connectingCircles(db, viewerId, subjectId) {
+  if (!viewerId || !subjectId || viewerId === subjectId) return [];
+  if (isBlockedBy(db, viewerId, subjectId)) return [];
+  return db.prepare(`
+    SELECT DISTINCT g.id, g.name FROM groups g
+    JOIN group_members me ON me.group_id = g.id AND me.user_id = ?
+    WHERE g.id IN (SELECT group_id FROM group_members WHERE user_id = ?)
+       OR g.id IN (SELECT gm.group_id FROM group_members gm JOIN guardian_links gl ON gl.guardian_id = gm.user_id WHERE gl.dependent_id = ?)
+    ORDER BY g.name ASC
+  `).all(viewerId, subjectId, subjectId);
 }
 
 export function hasApprovedFollow(db, followerId, { userId = null, listId = null } = {}) {

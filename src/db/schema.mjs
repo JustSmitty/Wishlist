@@ -55,6 +55,67 @@ function runMigrations(db) {
     db.exec('ALTER TABLE users ADD COLUMN google_sub TEXT;');
   }
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub ON users(google_sub) WHERE google_sub IS NOT NULL;');
+  // Co-ownership is offered, not imposed: an invitation waits here until the
+  // person accepts it.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS list_invites (
+      list_id TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      invited_by TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (list_id, user_id),
+      FOREIGN KEY (list_id) REFERENCES lists(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_list_invites_user ON list_invites(user_id);
+  `);
+  // "Find my reservation" for guests who lost the browser that made it.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS claim_recoveries (
+      id TEXT PRIMARY KEY,
+      email TEXT NOT NULL,
+      list_id TEXT NOT NULL,
+      code_hash TEXT NOT NULL,
+      attempts INTEGER NOT NULL DEFAULT 0,
+      expires_at TEXT NOT NULL,
+      used_at TEXT,
+      created_at TEXT NOT NULL
+    );
+  `);
+  // A secret idea belongs to one circle: the one its author chose to share it with.
+  if (!cols('secret_ideas').has('group_id')) {
+    db.exec('ALTER TABLE secret_ideas ADD COLUMN group_id TEXT;');
+    // Existing ideas are kept where there is no doubt: the author and the
+    // subject share exactly one circle. Otherwise only the author sees the
+    // idea until they choose a circle for it.
+    const ideas = db.prepare('SELECT id, author_id, subject_user_id FROM secret_ideas').all();
+    for (const idea of ideas) {
+      const shared = db.prepare(`
+        SELECT DISTINCT me.group_id FROM group_members me
+        WHERE me.user_id = ? AND (
+          me.group_id IN (SELECT group_id FROM group_members WHERE user_id = ?)
+          OR me.group_id IN (SELECT gm.group_id FROM group_members gm JOIN guardian_links gl ON gl.guardian_id = gm.user_id WHERE gl.dependent_id = ?)
+        )
+      `).all(idea.author_id, idea.subject_user_id, idea.subject_user_id);
+      if (shared.length === 1) db.prepare('UPDATE secret_ideas SET group_id = ? WHERE id = ?').run(shared[0].group_id, idea.id);
+    }
+  }
+  // Browsers a person has signed in on before. Code requests from them are not
+  // subject to the per-address limits, so nobody can lock a person out of the
+  // devices they already use by flooding their address.
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS trusted_devices (
+      token_hash TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      last_used_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_trusted_devices_user ON trusted_devices(user_id);
+  `);
+  if (!cols('auth_challenges').has('trusted')) {
+    db.exec('ALTER TABLE auth_challenges ADD COLUMN trusted INTEGER NOT NULL DEFAULT 0;');
+  }
   // One row per Google sign-in in progress: what the browser must bring back.
   db.exec(`
     CREATE TABLE IF NOT EXISTS oauth_states (

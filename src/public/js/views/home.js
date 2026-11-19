@@ -21,12 +21,14 @@ export default {
   title: (data) => data.active?.name || 'My lists',
 
   async load(params) {
-    const { lists } = await get('/api/lists');
-    const active = lists.find(l => l.id === params[0]) || lists.find(l => !l.archived_at) || lists[0] || null;
-    return { lists, active };
+    // The index has every list in summary; the open list is fetched in full.
+    const { lists, invitations = [] } = await get('/api/lists');
+    const chosen = lists.find(l => l.id === params[0]) || lists.find(l => !l.archived_at) || lists[0] || null;
+    const active = chosen ? (await get(`/api/lists/${encodeURIComponent(chosen.id)}`)).list : null;
+    return { lists, active, invitations };
   },
 
-  render({ lists, active }) {
+  render({ lists, active, invitations = [] }) {
     const user = me();
     const mine = lists.filter(l => l.owner_id === user.id);
     return html`
@@ -44,6 +46,19 @@ export default {
         </div>
       </header>
 
+      ${invitations.map(inv => html`
+        <div class="notice notice--honey" role="status">
+          ${icon('people')}
+          <div class="grow">
+            <strong>${inv.invited_by_name} invited you to co-own "${inv.list_name}".</strong>
+            As a co-owner you can add and edit its wishes. Like its owner, you will not see what has been reserved while it is a surprise.
+            <div class="row hero__actions">
+              <button class="btn btn--sm btn--primary" type="button" data-action="invite-answer" data-list="${inv.list_id}" data-answer="accept_invite">Accept</button>
+              <button class="btn btn--sm" type="button" data-action="invite-answer" data-list="${inv.list_id}" data-answer="decline_invite">Decline</button>
+            </div>
+          </div>
+        </div>`)}
+
       ${lists.length > 0 ? html`
         <nav class="listbar" aria-label="Your lists">
           ${lists.map(l => html`
@@ -51,7 +66,7 @@ export default {
               ${swatch(l.id)}
               <span>
                 <span class="listchip__name">${l.name}</span>
-                <span class="listchip__count">${l.owner_id !== user.id ? `${l.owner_name} · ` : ''}${plural(l.items.filter(i => i.status === 'active').length, 'wish', 'wishes')}${l.archived_at ? ' · archived' : ''}</span>
+                <span class="listchip__count">${l.owner_id !== user.id ? `${l.owner_name} · ` : ''}${plural(l.item_count, 'wish', 'wishes')}${l.archived_at ? ' · archived' : ''}</span>
               </span>
             </a>`)}
         </nav>` : ''}
@@ -261,13 +276,20 @@ function receivedCard(item) {
 
 const data = () => store.current?.data || { lists: [], active: null };
 const findItem = (id) => {
-  for (const list of data().lists) {
-    const item = list.items.find(i => i.id === id);
-    if (item) return { item, list };
-  }
-  return null;
+  const list = data().active;
+  const item = list?.items.find(i => i.id === id);
+  return item ? { item, list } : null;
 };
-const findList = (id) => data().lists.find(l => l.id === id);
+// Actions on a list are offered on the open list only, which is the full copy.
+const findList = (id) => (data().active?.id === id ? data().active : data().lists.find(l => l.id === id));
+
+on('invite-answer', async (el) => {
+  const accept = el.dataset.answer === 'accept_invite';
+  await patch(`/api/lists/${encodeURIComponent(el.dataset.list)}`, { action: el.dataset.answer });
+  toast(accept ? 'You are now a co-owner of this list' : 'Invitation declined');
+  if (accept) await navigate(`/lists/${el.dataset.list}`);
+  else await refresh();
+});
 
 on('home-filter', (el) => { ui.filter = el.dataset.value; rerender(); });
 on('home-clear', () => { ui.filter = 'all'; ui.query = ''; rerender(); });
@@ -295,8 +317,10 @@ function listFields(list, { groups, people }, isNew) {
   const sharedWith = new Set((list?.shared_with_groups || []).map(g => g.id));
   // Circles the list is already shared with stay listed even if this person is not in them.
   const circleOptions = [...groups.map(g => ({ id: g.id, name: g.name })), ...(list?.shared_with_groups || []).filter(g => !groups.some(x => x.id === g.id))];
-  const coOwnerIds = new Set(list?.co_owner_ids || []);
-  const candidates = [...people, ...(list?.co_owners || []).filter(c => !people.some(p => p.id === c.id))];
+  const coOwnerIds = new Set([...(list?.co_owner_ids || []), ...(list?.pending_co_owners || []).map(p => p.id)]);
+  const pendingIds = new Set((list?.pending_co_owners || []).map(p => p.id));
+  const known = [...(list?.co_owners || []), ...(list?.pending_co_owners || [])];
+  const candidates = [...people, ...known.filter(c => !people.some(p => p.id === c.id))];
   const sealed = list && list.surprise_mode && !list.revealed_at;
   return html`
     ${isNew && owners.length > 1 ? html`
@@ -338,8 +362,8 @@ function listFields(list, { groups, people }, isNew) {
     ${manages && candidates.length ? html`
       <fieldset class="field">
         <legend class="label">Co-owners <span class="muted">(optional)</span></legend>
-        ${candidates.map(p => html`<label class="check"><input type="checkbox" name="coowner:${p.id}" ${coOwnerIds.has(p.id) ? raw('checked') : ''} /><span>${p.name}</span></label>`)}
-        <span class="field__hint">A co-owner can add and edit wishes with you. Like you, they do not see reservations on a surprise list. They are told, and can leave whenever they like.</span>
+        ${candidates.map(p => html`<label class="check"><input type="checkbox" name="coowner:${p.id}" ${coOwnerIds.has(p.id) ? raw('checked') : ''} /><span>${p.name}${pendingIds.has(p.id) ? html` <small>invited, not yet accepted</small>` : ''}</span></label>`)}
+        <span class="field__hint">A co-owner can add and edit wishes with you. Like you, they do not see reservations on a surprise list. They are invited, become a co-owner only if they accept, and can leave whenever they like.</span>
       </fieldset>` : ''}
     ${manages && people.length ? html`
       <div class="field">
@@ -399,7 +423,7 @@ on('edit-list', async (el) => {
         ...((v.event_date || null) !== (list.event_date || null) ? { event_date: v.event_date || null } : {}),
         ...(manages && v.visibility ? { visibility: v.visibility } : {}),
         ...(same(groupIds, before) ? {} : { group_ids: groupIds }),
-        ...(manages && !same(coOwners, list.co_owner_ids || []) ? { co_owner_ids: coOwners } : {}),
+        ...(manages && !same(coOwners, [...(list.co_owner_ids || []), ...(list.pending_co_owners || []).map(p => p.id)]) ? { co_owner_ids: coOwners } : {}),
         ...(manages && v.helper_user_id !== undefined ? { helper_user_id: v.helper_user_id || null } : {})
       });
       toast('Saved');

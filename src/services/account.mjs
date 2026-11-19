@@ -134,6 +134,8 @@ function erasePerson(db, userId) {
   }
 
   db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
+  db.prepare('DELETE FROM trusted_devices WHERE user_id = ?').run(userId);
+  db.prepare('DELETE FROM list_invites WHERE user_id = ? OR invited_by = ?').run(userId, userId);
   db.prepare('DELETE FROM guardian_links WHERE guardian_id = ? OR dependent_id = ?').run(userId, userId);
   db.prepare("DELETE FROM list_shares WHERE grantee_type = 'user' AND grantee_id = ?").run(userId);
   db.prepare("DELETE FROM follows WHERE follower_id = ? OR (target_type = 'user' AND target_id = ?)").run(userId, userId);

@@ -88,6 +88,7 @@ test('items: only editors of the list — and of the destination — can change,
 
     // Elena co-owns list A of Justin's; that gives her nothing on his list B.
     const a = (await justin.post('/api/lists', { name: 'A', co_owner_ids: ['usr_elena'] })).json.list;
+    assert.equal((await elena.patch(`/api/lists/${a.id}`, { action: 'accept_invite' })).status, 200);
     const b = (await justin.post('/api/lists', { name: 'B', visibility: 'private' })).json.list;
     const item = (await elena.post('/api/items', { list_id: a.id, title: 'Shared thing' })).json.item;
     for (const action of ['move_to_list', 'copy_to_list']) {

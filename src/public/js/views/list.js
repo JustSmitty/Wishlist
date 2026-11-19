@@ -92,6 +92,12 @@ export default {
           : html`<p class="muted">Nothing matches. <button class="btn btn--quiet btn--sm" type="button" data-action="list-clear">Clear filters</button></p>`}
       ` : empty({ title: 'No wishes yet', text: `${first} has not added anything to this list yet. Check back soon.`, seed: list.id })}
 
+      ${!me() && list.viewer_role === 'guest' && !list.archived_at ? html`
+        <p class="small muted row section-title">
+          <span>Reserved something here from another phone or browser?</span>
+          <button class="btn btn--quiet btn--sm" type="button" data-action="recover-claims">Find my reservation</button>
+        </p>` : ''}
+
       ${isOwner ? '' : html`
         <p class="small muted row section-title">
           <span>Something wrong with this list?</span>
@@ -342,6 +348,42 @@ on('withdraw-pledge', async (el) => {
   await del(`/api/contributions/${el.dataset.pledge}`);
   toast('Pledge withdrawn');
   await refresh();
+});
+
+on('recover-claims', () => {
+  const key = store.current?.params?.[0];
+  let recoveryId = null;
+  openSheet({
+    title: 'Find my reservation',
+    intro: 'Enter the email address you reserved with. We send it a code; once you enter it, this browser can manage your reservation again.',
+    size: 'narrow', submitLabel: 'Send me a code',
+    body: html`
+      <div data-step="email"><div class="field"><label for="rc-email">Email</label><input id="rc-email" name="email" type="email" required autocomplete="email" /></div></div>
+      <div data-step="code" hidden><div class="field"><label for="rc-code">8-digit code</label>
+        <input id="rc-code" name="code" class="codebox" inputmode="numeric" autocomplete="one-time-code" maxlength="8" pattern="[0-9]{8}" />
+        <span class="field__hint" data-hint>Check your email. The code works for 30 minutes. Any other browser that could manage this reservation will no longer be able to.</span></div></div>`,
+    onSubmit: async (v, sheet) => {
+      if (!recoveryId) {
+        const res = await post('/api/claims/recover', { list: key, email: v.email });
+        recoveryId = res.recovery_id;
+        sheet.form.querySelector('[data-step="email"]').hidden = true;
+        sheet.form.querySelector('[data-step="code"]').hidden = false;
+        const code = sheet.form.elements.code;
+        code.required = true;
+        if (res.demo_code) {
+          code.value = res.demo_code;
+          sheet.form.querySelector('[data-hint]').textContent = 'Demo mode does not send email, so the code has been filled in for you.';
+        }
+        sheet.setSubmitLabel('Confirm');
+        code.focus();
+        return false;
+      }
+      const { manage_tokens: tokens } = await post('/api/claims/recover/verify', { recovery_id: recoveryId, code: v.code });
+      for (const t of tokens) rememberGuestToken(t);
+      toast(tokens.length ? `Found ${plural(tokens.length, 'reservation')}. You can manage it here again.` : 'No reservations on this list were made with that address.');
+      await refresh();
+    }
+  });
 });
 
 on('stop-helping', async (el) => {

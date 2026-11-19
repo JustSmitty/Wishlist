@@ -155,14 +155,15 @@ function personCard(p) {
             <span class="row">${icon('lock', { size: 17 })} Secret ideas for ${first}</span>
             <button class="btn btn--sm" type="button" data-action="add-secret" data-user="${p.person.id}" data-name="${first}">${icon('plus', { size: 16 })} Add</button>
           </div>
-          ${p.secret_ideas.length === 0 ? html`<p class="small">Spotted something ${first} would love? Jot it down. ${first} can never see this, and your circle can.</p>` : ''}
+          ${p.secret_ideas.length === 0 ? html`<p class="small">Spotted something ${first} would love? Jot it down. ${first} can never see it; the circle you choose can.</p>` : ''}
           ${p.secret_ideas.map(s => html`
             <div class="secret">
               <strong>${s.url ? html`<a href="${safeUrl(s.url)}" target="_blank" rel="noopener noreferrer">${s.title}</a>` : s.title}</strong>
               ${s.estimated_price ? html` · ${money(s.estimated_price)}` : ''}
               ${s.note ? html`<div class="muted">${s.note}</div>` : ''}
               <div class="secret__meta">
-                <span>from ${s.is_mine ? 'you' : s.author_name}</span>
+                <span>from ${s.is_mine ? 'you' : s.author_name} · ${s.circle ? `seen by ${s.circle.name}` : 'only you can see this so far'}</span>
+                ${s.is_mine && (!s.circle || p.secret_idea_circles.length > 1) ? html`<button class="btn btn--quiet btn--sm" type="button" data-action="move-secret" data-secret="${s.id}" data-user="${p.person.id}">${s.circle ? 'Change circle' : 'Choose a circle'}</button>` : ''}
                 ${s.is_mine ? html`<button class="btn btn--quiet btn--sm" type="button" data-action="remove-secret" data-secret="${s.id}">Remove</button>` : ''}
               </div>
             </div>`)}
@@ -223,11 +224,22 @@ on('set-budget', (el) => {
   });
 });
 
+const circlesFor = (userId) => store.current?.data?.people.find(p => p.person.id === userId)?.secret_idea_circles || [];
+const circlePicker = (circles, selected = null) => circles.length > 1 ? html`
+  <div class="field"><label for="se-circle">Who can see it</label>
+    <select id="se-circle" name="group_id" required>
+      ${selected ? '' : html`<option value="">Choose a circle</option>`}
+      ${circles.map(c => html`<option value="${c.id}" ${c.id === selected ? raw('selected') : ''}>${c.name}</option>`)}
+    </select>
+    <span class="field__hint">Only people in that circle see this idea.</span></div>` : '';
+
 on('add-secret', (el) => {
+  const circles = circlesFor(el.dataset.user);
   openSheet({
     title: `A secret idea for ${el.dataset.name}`,
-    intro: `Your circle can see it. ${el.dataset.name} never can.`,
+    intro: circles.length === 1 ? `${circles[0].name} can see it. ${el.dataset.name} never can.` : `The circle you choose can see it. ${el.dataset.name} never can.`,
     body: html`
+      ${circlePicker(circles)}
       <div class="field"><label for="se-title">The idea</label><input id="se-title" name="title" required maxlength="200" placeholder="Tickets to that concert she mentioned" /></div>
       <div class="fields">
         <div class="field"><label for="se-price">Roughly how much <span class="muted">(optional)</span></label><input id="se-price" name="estimated_price" type="number" min="0" step="0.01" inputmode="decimal" /></div>
@@ -236,8 +248,22 @@ on('add-secret', (el) => {
       <div class="field"><label for="se-note">Note <span class="muted">(optional)</span></label><input id="se-note" name="note" maxlength="500" placeholder="She pointed it out at the market" /></div>`,
     submitLabel: 'Save idea',
     onSubmit: async (v) => {
-      await post('/api/secret-ideas', { subject_user_id: el.dataset.user, title: v.title, estimated_price: v.estimated_price || null, url: v.url || null, note: v.note });
+      await post('/api/secret-ideas', { subject_user_id: el.dataset.user, title: v.title, estimated_price: v.estimated_price || null, url: v.url || null, note: v.note, group_id: v.group_id || undefined });
       toast('Idea saved. Mum\'s the word.');
+      await refresh();
+    }
+  });
+});
+
+on('move-secret', (el) => {
+  const circles = circlesFor(el.dataset.user);
+  const idea = store.current.data.people.flatMap(p => p.secret_ideas).find(s => s.id === el.dataset.secret);
+  openSheet({
+    title: 'Who can see this idea', size: 'narrow', submitLabel: 'Save',
+    body: circles.length > 1 ? circlePicker(circles, idea?.circle?.id) : html`<input type="hidden" name="group_id" value="${circles[0]?.id || ''}" /><p>Share it with ${circles[0]?.name}?</p>`,
+    onSubmit: async (v) => {
+      await patch(`/api/secret-ideas/${el.dataset.secret}`, { group_id: v.group_id });
+      toast('Saved');
       await refresh();
     }
   });

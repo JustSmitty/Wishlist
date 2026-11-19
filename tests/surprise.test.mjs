@@ -165,6 +165,24 @@ test('secret ideas: circle members only, never the subject, strangers cannot rea
     assert.ok(!JSON.stringify(mayaDash.json).includes('Botanical'), 'the idea about Maya is nowhere in her payload');
     assert.equal((await maya.post('/api/secret-ideas', { subject_user_id: 'usr_maya', title: 'x' })).status, 403);
 
+    // An idea belongs to the circle its author chose. Justin and Elena share
+    // a second circle without Maya's relatives in it…
+    const elena = await app.as('usr_elena');
+    const book = (await elena.post('/api/groups', { name: 'Book club' })).json.group;
+    const code = (await elena.get('/api/groups')).json.groups.find(g => g.id === book.id).invite_code;
+    await justin.post('/api/groups/join', { invite_code: code });
+    const reader = await app.signUp('reader@example.com', 'Reader', { invite_code: code });
+    await maya.post('/api/groups/join', { invite_code: code });
+    // …so with two possible circles Elena must say which, and only that circle sees it.
+    assert.equal((await elena.post('/api/secret-ideas', { subject_user_id: 'usr_maya', title: 'Club idea' })).status, 400);
+    assert.equal((await elena.post('/api/secret-ideas', { subject_user_id: 'usr_maya', title: 'Club idea', group_id: 'grp_nope' })).status, 403);
+    assert.equal((await elena.post('/api/secret-ideas', { subject_user_id: 'usr_maya', title: 'Club idea', group_id: book.id })).status, 201);
+    const titles = async (who) => (card(await who.get('/api/dashboard'), 'usr_maya')?.secret_ideas || []).map(i => i.title).sort();
+    assert.deepEqual(await titles(reader), ['Club idea'], 'the book club sees only the book-club idea, not the family one');
+    assert.deepEqual(await titles(justin), ['Club idea', 'Framed Vintage Botanical Print from our Portland Trip']);
+    assert.deepEqual(card(await elena.get('/api/dashboard'), 'usr_maya').secret_idea_circles.map(c => c.name).sort(), ['Book club', 'Smith Family Circle']);
+    assert.ok(!JSON.stringify((await maya.get('/api/dashboard')).json).includes('Club idea'));
+
     const mallory = await app.signUp('mallory@example.com', 'Mallory');
     assert.equal((await mallory.post('/api/secret-ideas', { subject_user_id: 'usr_maya', title: 'rumour' })).status, 403);
     const follow = await mallory.post('/api/follows', { target_id: 'usr_maya' });

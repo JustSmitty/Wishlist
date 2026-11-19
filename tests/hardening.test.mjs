@@ -157,6 +157,11 @@ test('people on a list: only the owner chooses them, they are told, they can lea
     const elena = await app.as('usr_elena');
     const arthur = await app.as('usr_arthur');
     const list = (await justin.post('/api/lists', { name: 'Shared', co_owner_ids: ['usr_elena'], helper_user_id: 'usr_maya' })).json.list;
+    assert.deepEqual([list.co_owner_ids, list.pending_co_owners.map(p => p.id)], [[], ['usr_elena']], 'named, not yet a co-owner');
+    assert.equal((await elena.patch(`/api/lists/${list.id}`, { name: 'Before accepting' })).status, 403);
+    assert.equal((await elena.get('/api/lists')).json.invitations[0].list_id, list.id);
+    assert.equal((await arthur.patch(`/api/lists/${list.id}`, { action: 'accept_invite' })).status, 404, 'only the invited person can accept');
+    assert.equal((await elena.patch(`/api/lists/${list.id}`, { action: 'accept_invite' })).status, 200);
     const privateList = (await justin.post('/api/lists', { name: 'Private plans', visibility: 'private' })).json.list;
     await justin.post('/api/items', { list_id: privateList.id, title: 'Engagement ring' });
     assert.equal(app.db.prepare("SELECT COUNT(*) AS n FROM notifications_outbox WHERE recipient_user_id = 'usr_elena' AND event_type = 'added_to_list'").get().n, 1);
@@ -187,9 +192,19 @@ test('people on a list: only the owner chooses them, they are told, they can lea
     // Taking a list off link sharing retires the old link.
     const oldToken = shared.share_token;
     await justin.patch(`/api/lists/${list.id}`, { visibility: 'specific' });
-    const relinked = (await justin.patch(`/api/lists/${list.id}`, { visibility: 'link' })).json.list;
-    assert.notEqual(relinked.share_token, oldToken);
     assert.equal((await app.guest.get(`/api/lists/${oldToken}`)).status, 404);
+    // And a surprise list that has wishes cannot be opened to link sharing
+    // again — the same answer whether or not anything on it is reserved.
+    const relink = await justin.patch(`/api/lists/${list.id}`, { visibility: 'link' });
+    const emptyish = (await justin.post('/api/lists', { name: 'Unreserved', visibility: 'specific' })).json.list;
+    await justin.post('/api/items', { list_id: emptyish.id, title: 'Nobody has this' });
+    const relinkUnreserved = await justin.patch(`/api/lists/${emptyish.id}`, { visibility: 'link' });
+    assert.equal(relink.status, 409);
+    assert.deepEqual(relink.json, relinkUnreserved.json);
+    // An empty list, or one that is not a surprise, can be shared by link; it gets a new link.
+    const fresh = (await justin.post('/api/lists', { name: 'Empty', visibility: 'specific' })).json.list;
+    const relinked = (await justin.patch(`/api/lists/${fresh.id}`, { visibility: 'link' })).json.list;
+    assert.equal(relinked.visibility, 'link');
 
     // Someone named on a list can step away; a stranger cannot "leave" to probe.
     assert.equal((await arthur.patch(`/api/lists/${list.id}`, { action: 'leave' })).status, 404);
@@ -276,7 +291,7 @@ test('closing an account leaves no trace of the person and no loose ends for oth
     const code = (await nina.get('/api/groups')).json.groups[0].invite_code;
     const friend = await app.signUp('friend@example.com', 'Friend', { invite_code: code });
     // Things that put Nina's name, or her list's name, into other people's inboxes and records.
-    const bike = (await nina.get('/api/lists')).json.lists[0].items[0];
+    const bike = (await nina.get(`/api/lists/${listId}`)).json.list.items[0];
     const held = (await friend.post('/api/claims', { item_id: bike.id })).json.claim;
     await friend.post('/api/follows', { target_id: nina.user.id });
     await nina.post('/api/follows', { target_id: friend.user.id });
@@ -571,5 +586,108 @@ test('guest reservations: one browser can manage several, a signed-in person can
     const sneaky = await app.guest.post('/api/claims', { item_id: 'itm_j4', guest_email: 'justin@smith.example' });
     const refused = await app.guest.post('/api/claims/verify', { claim_id: sneaky.json.claim.id, code: sneaky.json.claim.demo_verification_code });
     assert.equal(refused.status, 403);
+  } finally { await app.close(); }
+});
+
+test('sign-in lockout: flooding an address from many places cannot keep its owner out of a browser they have used', async () => {
+  const { rememberDevice } = await import('../src/services/auth.mjs');
+  const db = testDb();
+  const victim = 'maya@smith.example';
+  // An attacker asks for codes to Maya's address from twelve different places.
+  let refused = 0;
+  for (let i = 0; i < 12; i++) {
+    try { startSignIn(db, { email: victim, requester: `198.51.100.${i}` }); } catch { refused++; }
+  }
+  assert.equal(refused, 2, 'the address takes ten untrusted requests an hour');
+  assert.throws(() => startSignIn(db, { email: victim, requester: '203.0.113.9' }), /Too many codes/);
+
+  // Maya, on the browser she signed in on before, still gets her code and gets in.
+  const device = rememberDevice(db, 'usr_maya').token;
+  const mine = startSignIn(db, { email: victim, requester: '203.0.113.9', deviceToken: device });
+  assert.equal(completeSignIn(db, { challengeId: mine.challenge_id, code: mine.code }).user.id, 'usr_maya');
+  // Someone else's device cookie does not count for her address.
+  const justinsDevice = rememberDevice(db, 'usr_justin').token;
+  assert.throws(() => startSignIn(db, { email: victim, requester: '203.0.113.9', deviceToken: justinsDevice }), /Too many codes/);
+
+  // Wrong guesses from unknown browsers are capped per address per day, across all codes.
+  const d2 = testDb();
+  const challenges = [];
+  for (let i = 0; i < 6; i++) challenges.push(startSignIn(d2, { email: 'elena@vance.example', requester: `192.0.2.${i}` }));
+  for (const c of challenges) for (let k = 0; k < 5; k++) { try { completeSignIn(d2, { challengeId: c.challenge_id, code: '00000000' }); } catch { /* wrong */ } }
+  const fresh = startSignIn(d2, { email: 'elena@vance.example', requester: '192.0.2.99' });
+  assert.throws(() => completeSignIn(d2, { challengeId: fresh.challenge_id, code: fresh.code }), /Too many wrong codes for this address today/);
+  const known = startSignIn(d2, { email: 'elena@vance.example', requester: '192.0.2.99', deviceToken: rememberDevice(d2, 'usr_elena').token });
+  assert.equal(completeSignIn(d2, { challengeId: known.challenge_id, code: known.code }).user.id, 'usr_elena', 'her own browser is not affected');
+
+  // Over HTTP: signing in remembers the browser, and that browser is not locked out.
+  const app = await startApp();
+  try {
+    const started = await app.guest.post('/api/auth/start', { email: 'arthur@smith.example' });
+    const done = await app.guest.post('/api/auth/verify', { challenge_id: started.json.challenge_id, code: started.json.demo_code });
+    const cookies = done.headers.getSetCookie();
+    const deviceCookie = cookies.find(c => c.startsWith('hl_device='));
+    assert.match(deviceCookie, /Path=\/api\/auth; HttpOnly; SameSite=Lax; Max-Age=31536000/);
+    for (let i = 0; i < 10; i++) app.db.prepare("INSERT INTO auth_challenges (id, email, code_hash, expires_at, created_at, requester) VALUES (?, 'arthur@smith.example', 'x', ?, ?, ?)")
+      .run(`chl_flood_${i}`, new Date(Date.now() + 600000).toISOString(), new Date().toISOString(), `10.0.0.${i}`);
+    assert.equal((await app.guest.post('/api/auth/start', { email: 'arthur@smith.example' })).status, 429);
+    assert.equal((await app.client(deviceCookie.split(';')[0]).post('/api/auth/start', { email: 'arthur@smith.example' })).status, 200);
+  } finally { await app.close(); }
+});
+
+test('co-ownership is an invitation: nothing changes until it is accepted, and an administrator cannot be shielded from their own console', async () => {
+  const app = await startApp();
+  try {
+    const justin = await app.as('usr_justin'); // the administrator
+    const elena = await app.as('usr_elena');
+    const maya = await app.as('usr_maya');
+    // Elena names the administrator as co-owner of her list.
+    await elena.patch('/api/lists/lst_elena_holiday', { co_owner_ids: ['usr_justin'] });
+    const admin = (await justin.get('/api/admin')).json;
+    assert.ok(admin.overridable_claims.some(c => c.list_name === "Elena's kitchen & garden wishes"), 'still in the console: he has not accepted');
+    assert.equal((await justin.get('/api/lists/lst_elena_holiday')).json.list.viewer_role !== 'owner', true);
+
+    // Declining removes the invitation; it cannot then be accepted.
+    assert.equal((await justin.patch('/api/lists/lst_elena_holiday', { action: 'decline_invite' })).status, 200);
+    assert.equal((await justin.patch('/api/lists/lst_elena_holiday', { action: 'accept_invite' })).status, 404);
+    assert.deepEqual((await justin.get('/api/lists')).json.invitations, []);
+
+    // An invitation goes stale if the two are no longer connected.
+    await elena.patch('/api/lists/lst_elena_holiday', { co_owner_ids: ['usr_maya'] });
+    await maya.post('/api/blocks', { user_id: 'usr_elena' });
+    assert.equal((await maya.patch('/api/lists/lst_elena_holiday', { action: 'accept_invite' })).status, 404, 'a block removed the invitation');
+    await maya.del('/api/blocks/usr_elena');
+    await elena.patch('/api/lists/lst_elena_holiday', { co_owner_ids: ['usr_maya'] });
+    await app.db.prepare("DELETE FROM group_members WHERE user_id = 'usr_elena'").run();
+    assert.equal((await maya.patch('/api/lists/lst_elena_holiday', { action: 'accept_invite' })).status, 409, 'no longer in a circle together');
+  } finally { await app.close(); }
+});
+
+test('a guest who lost the browser that reserved can get the reservation back with an email code', async () => {
+  const app = await startApp();
+  try {
+    const made = await app.guest.post('/api/claims', { item_id: 'itm_m3', guest_email: 'cousin.sam@example.com' });
+    const first = await app.guest.post('/api/claims/verify', { claim_id: made.json.claim.id, code: made.json.claim.demo_verification_code });
+    const oldToken = first.json.claim.manage_token;
+
+    // Same answer whether or not the address has reserved anything on the list.
+    const someone = await app.guest.post('/api/claims/recover', { list: 'maya-birthday-2026', email: 'cousin.sam@example.com' });
+    const nobody = await app.guest.post('/api/claims/recover', { list: 'maya-birthday-2026', email: 'nobody@example.com' });
+    assert.deepEqual(Object.keys(someone.json).sort(), Object.keys(nobody.json).sort());
+    assert.equal(someone.status, nobody.status);
+    // Wrong code, then the right one: fresh manage tokens; the old browser's token stops working.
+    assert.equal((await app.guest.post('/api/claims/recover/verify', { recovery_id: someone.json.recovery_id, code: '00000000' })).status, 400);
+    const back = await app.guest.post('/api/claims/recover/verify', { recovery_id: someone.json.recovery_id, code: someone.json.demo_code });
+    assert.equal(back.json.manage_tokens.length, 1);
+    const browser = app.guest.withHeaders({ 'X-Guest-Token': back.json.manage_tokens[0] });
+    const mine = (await browser.get('/api/lists/maya-birthday-2026')).json.list.items.flatMap(i => i.claim_summary.claims).filter(c => c.is_own_claim);
+    assert.equal(mine.length, 1);
+    assert.equal((await app.guest.withHeaders({ 'X-Guest-Token': oldToken }).patch(`/api/claims/${made.json.claim.id}`, { status: 'released' })).status, 403);
+    // A code is used once, and the address with nothing reserved gets nothing.
+    assert.equal((await app.guest.post('/api/claims/recover/verify', { recovery_id: someone.json.recovery_id, code: someone.json.demo_code })).status, 400);
+    assert.deepEqual((await app.guest.post('/api/claims/recover/verify', { recovery_id: nobody.json.recovery_id, code: nobody.json.demo_code })).json.manage_tokens, []);
+    // Five wrong codes end it.
+    const again = await app.guest.post('/api/claims/recover', { list: 'maya-birthday-2026', email: 'cousin.sam@example.com' });
+    for (let i = 0; i < 5; i++) await app.guest.post('/api/claims/recover/verify', { recovery_id: again.json.recovery_id, code: '11111111' });
+    assert.equal((await app.guest.post('/api/claims/recover/verify', { recovery_id: again.json.recovery_id, code: again.json.demo_code })).status, 400);
   } finally { await app.close(); }
 });

@@ -371,8 +371,8 @@ function insertDemoData(db) {
   // 10. Seed Secret Ideas (GVR-5: Private gift ideas for someone else — invisible to subject!)
   const insertSecret = db.prepare(`
     INSERT INTO secret_ideas (
-      id, subject_user_id, author_id, title, url, estimated_price, note, claimed_by_user_id, created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      id, subject_user_id, author_id, title, url, estimated_price, note, claimed_by_user_id, created_at, group_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'grp_smith')
   `);
   // Secret idea ABOUT Maya authored by Aunt Elena (Justin can see it; Maya can NEVER see it!)
   insertSecret.run(

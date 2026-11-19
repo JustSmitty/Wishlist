@@ -96,34 +96,91 @@ export function countApiTokens(db, userId) {
  * Step 1: send a code. The response is identical whether or not the address
  * already has an account, so this cannot be used to discover who is a member.
  */
-export function startSignIn(db, { email, requester = null }) {
+// Limits on codes for one address from browsers it has not signed in on.
+const PER_REQUESTER_15_MIN = 5;
+const PER_ADDRESS_HOUR = 10;
+const PER_ADDRESS_DAY = 30;
+const WRONG_GUESSES_PER_ADDRESS_DAY = 30;
+const PER_DEVICE_15_MIN = 10;
+const DEVICE_DAYS = 365;
+
+/** The user a trusted-device cookie belongs to, if it is live. */
+export function trustedDeviceUser(db, token) {
+  if (!token || typeof token !== 'string' || token.length > 200) return null;
+  const row = db.prepare('SELECT * FROM trusted_devices WHERE token_hash = ?').get(sha256(token));
+  if (!row || row.expires_at <= new Date().toISOString()) return null;
+  return db.prepare("SELECT * FROM users WHERE id = ? AND status = 'active'").get(row.user_id) || null;
+}
+
+/**
+ * Remembers this browser for this person (or refreshes the record if it
+ * already is). Returns the cookie value to set.
+ */
+export function rememberDevice(db, userId, existingToken = null) {
+  const now = new Date();
+  const expires = new Date(now.getTime() + DEVICE_DAYS * 86400 * 1000).toISOString();
+  if (existingToken && trustedDeviceUser(db, existingToken)?.id === userId) {
+    db.prepare('UPDATE trusted_devices SET last_used_at = ?, expires_at = ? WHERE token_hash = ?').run(now.toISOString(), expires, sha256(existingToken));
+    return { token: existingToken, maxAgeSeconds: DEVICE_DAYS * 86400 };
+  }
+  const token = secretToken('hld');
+  db.prepare('INSERT INTO trusted_devices (token_hash, user_id, created_at, last_used_at, expires_at) VALUES (?, ?, ?, ?, ?)')
+    .run(sha256(token), userId, now.toISOString(), now.toISOString(), expires);
+  // A person has a bounded number of remembered browsers; the oldest go first.
+  db.prepare(`
+    DELETE FROM trusted_devices WHERE user_id = ? AND token_hash NOT IN (
+      SELECT token_hash FROM trusted_devices WHERE user_id = ? ORDER BY last_used_at DESC LIMIT 20
+    )
+  `).run(userId, userId);
+  return { token, maxAgeSeconds: DEVICE_DAYS * 86400 };
+}
+
+export function forgetDevices(db, userId) {
+  db.prepare('DELETE FROM trusted_devices WHERE user_id = ?').run(userId);
+}
+
+/**
+ * Step 1: send a code. The response is identical whether or not the address
+ * already has an account, so this cannot be used to discover who is a member.
+ *
+ * A browser this person has signed in on before (it carries their device
+ * cookie) is limited on its own, and is not affected by anyone else asking
+ * for codes to the same address. Everyone else shares tight per-address
+ * limits, which bound both the mail anyone can cause and the guesses anyone
+ * can make.
+ */
+export function startSignIn(db, { email, requester = null, deviceToken = null }) {
   const normalized = normalizeEmail(email);
   if (!normalized) throw badRequest('Enter a valid email address');
 
   const now = new Date();
-  // Two limits. The tight one is per requester, so one person hammering an
-  // address cannot use up its allowance and lock the real owner out. The
-  // loose one is per address, and bounds how much mail anyone can cause.
   const since = (minutes) => new Date(now.getTime() - minutes * 60 * 1000).toISOString();
-  const byRequester = db.prepare(
-    'SELECT COUNT(*) AS n FROM auth_challenges WHERE email = ? AND requester IS ? AND created_at > ?'
-  ).get(normalized, requester, since(15)).n;
-  const byAddress = db.prepare(
-    'SELECT COUNT(*) AS n FROM auth_challenges WHERE email = ? AND created_at > ?'
-  ).get(normalized, since(60)).n;
-  if (byRequester >= 5 || byAddress >= 20) {
-    throw tooMany('Too many codes requested for this address. Try again in a few minutes.');
+  const device = trustedDeviceUser(db, deviceToken);
+  const trusted = Boolean(device && device.email && device.email.toLowerCase() === normalized);
+
+  if (trusted) {
+    const byDevice = db.prepare(
+      'SELECT COUNT(*) AS n FROM auth_challenges WHERE email = ? AND trusted = 1 AND requester IS ? AND created_at > ?'
+    ).get(normalized, `device:${sha256(deviceToken)}`, since(15)).n;
+    if (byDevice >= PER_DEVICE_15_MIN) throw tooMany('Too many codes requested. Try again in a few minutes.');
+  } else {
+    const count = (where, ...args) => db.prepare(`SELECT COUNT(*) AS n FROM auth_challenges WHERE email = ? AND trusted = 0 AND ${where}`).get(normalized, ...args).n;
+    if (count('requester IS ? AND created_at > ?', requester, since(15)) >= PER_REQUESTER_15_MIN ||
+        count('created_at > ?', since(60)) >= PER_ADDRESS_HOUR ||
+        count('created_at > ?', since(24 * 60)) >= PER_ADDRESS_DAY) {
+      throw tooMany('Too many codes requested for this address. Try again later, or sign in from a device you have used before.');
+    }
   }
 
   const id = secretToken('chl');
   const code = signInCode();
   db.prepare(`
-    INSERT INTO auth_challenges (id, email, code_hash, expires_at, created_at, requester)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO auth_challenges (id, email, code_hash, expires_at, created_at, requester, trusted)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
   `).run(
     id, normalized, sha256(`${id}:${code}`),
     new Date(now.getTime() + CHALLENGE_MINUTES * 60 * 1000).toISOString(),
-    now.toISOString(), requester
+    now.toISOString(), trusted ? `device:${sha256(deviceToken)}` : requester, trusted ? 1 : 0
   );
 
   sendNotification(db, {
@@ -155,6 +212,17 @@ export function completeSignIn(db, { challengeId, code, profile = null, adminEma
   // challenge id alone is never enough.
   if (challenge.attempts >= MAX_CODE_ATTEMPTS) {
     throw tooMany('Too many wrong codes. Request a new one.');
+  }
+  // Across all of a day's codes for this address from unknown browsers,
+  // only so many wrong guesses are accepted. With eight-digit codes that
+  // keeps the chance of guessing one below one in three million a day.
+  if (!challenge.trusted) {
+    const wrongToday = db.prepare(`
+      SELECT COALESCE(SUM(attempts), 0) AS n FROM auth_challenges WHERE email = ? AND trusted = 0 AND created_at > ?
+    `).get(challenge.email, new Date(Date.now() - 86400 * 1000).toISOString()).n;
+    if (wrongToday >= WRONG_GUESSES_PER_ADDRESS_DAY) {
+      throw tooMany('Too many wrong codes for this address today. Sign in from a device you have used before, or with Google.');
+    }
   }
   const ok = safeEqual(challenge.code_hash, sha256(`${challenge.id}:${String(code ?? '').trim()}`));
   if (!ok) {
