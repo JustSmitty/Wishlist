@@ -49,19 +49,17 @@ HUSHLIST_GOOGLE_CLIENT_SECRET=...
 
 ## Sign in with Google: setting up the Google side
 
-These steps describe Google Cloud Console as I know it. I could not open Google's documentation from the session that wrote this, so check the wording against the console you see.
+From Google's guide "Using OAuth 2.0 for Web Server Applications" (https://developers.google.com/identity/protocols/oauth2/web-server), checked 20 November 2026:
 
-1. In Google Cloud Console, create a project, then configure the OAuth consent screen (app name, support email). Hushlist asks only for `openid email profile`.
-2. Create an OAuth client ID of type **Web application**.
-3. Add the authorised redirect URI, exactly: `https://gifts.example.com/api/auth/google/callback` (your `HUSHLIST_PUBLIC_URL` plus `/api/auth/google/callback`). For local testing also `http://localhost:3456/api/auth/google/callback`.
-4. Put the client ID and secret into `HUSHLIST_GOOGLE_CLIENT_ID` and `HUSHLIST_GOOGLE_CLIENT_SECRET`.
-5. While the consent screen is in testing mode Google only lets listed test users sign in; publish it when you are ready.
+1. In Google Cloud Console, go to the **Clients** page, click **Create Client**, and choose the **Web application** type. Google's guide points to its help article "Setting up your OAuth consent screen" for the consent screen; set that up too (Hushlist asks only for `openid email profile`).
+2. Add the authorised redirect URI, exactly: `https://gifts.example.com/api/auth/google/callback` (your `HUSHLIST_PUBLIC_URL` plus `/api/auth/google/callback`). Google requires redirect URIs to use HTTPS, except for localhost, and not to be raw IP addresses (localhost IPs excepted). The URI the app sends must exactly match one you registered. For local testing you can add `http://localhost:3456/api/auth/google/callback`.
+3. Put the client ID and secret into `HUSHLIST_GOOGLE_CLIENT_ID` and `HUSHLIST_GOOGLE_CLIENT_SECRET`.
 
-The endpoints Hushlist uses (`accounts.google.com/o/oauth2/v2/auth`, `oauth2.googleapis.com/token`, `www.googleapis.com/oauth2/v3/certs`), RS256 signatures and S256 PKCE were checked against Google's live discovery document, `https://accounts.google.com/.well-known/openid-configuration`.
+The endpoints Hushlist uses (`accounts.google.com/o/oauth2/v2/auth`, `oauth2.googleapis.com/token`, `www.googleapis.com/oauth2/v3/certs`), RS256 signatures and S256 PKCE were checked against Google's live discovery document, `https://accounts.google.com/.well-known/openid-configuration`. The ID token checks follow the list in Google's OpenID Connect guide (https://developers.google.com/identity/openid-connect/openid-connect): signature against the published keys, issuer `https://accounts.google.com` or `accounts.google.com`, audience equal to the client ID, expiry. The button is Google's own asset from its branding guidelines.
 
 ## Email: using a Gmail account to send
 
-Any SMTP provider works. If you want to send from a Gmail address, Google's SMTP server is commonly used as below. These details are from memory: I could not reach Google's help pages from the session that wrote this, so confirm them before relying on them.
+Any SMTP provider works. To send from a Gmail address:
 
 ```
 HUSHLIST_SMTP_HOST=smtp.gmail.com
@@ -71,17 +69,27 @@ HUSHLIST_SMTP_PASS=<an app password, not your Google password>
 HUSHLIST_MAIL_FROM=Hushlist <you@gmail.com>
 ```
 
-App passwords require 2-Step Verification on the Google account. Gmail applies daily sending limits to consumer accounts, so a dedicated transactional email provider is the better choice once more than a family uses the app.
+From Google's help pages, checked 20 November 2026:
+
+- App passwords "can only be used with accounts that have 2-Step Verification turned on", and the option may be missing for work or school accounts, accounts with Advanced Protection, and accounts whose 2-Step Verification uses only security keys (https://support.google.com/accounts/answer/185833).
+- A consumer Gmail account hits a limit when it sends "more than 500 emails ... in a day" (https://support.google.com/mail/answer/22839). Every sign-in code and guest code is an email, so a dedicated transactional email provider is the better choice beyond a family-sized group.
+
+Not verified: the server name and ports above. Google's page on sending from apps now redirects to `knowledge.workspace.google.com`, which I could not open. Confirm them in your Google account help before relying on them.
 
 ## Where to run it
 
-I could not open any hosting vendor's documentation from the session that wrote this, so what follows is the fit, not verified product detail. Check each vendor's current docs for volumes, pricing and limits.
+I cannot deploy it for you from here: that needs an account with a hosting provider, which only you can create and pay for. Any host that runs a Docker image with a persistent disk will do. What the vendors' own documentation says, checked 20 November 2026:
 
-| Option | Fit | What to watch |
+| Option | Fit | From the vendor's documentation |
 |---|---|---|
-| A small virtual machine (any provider) with Docker and a TLS reverse proxy such as Caddy or nginx | Good. Full control, one process, a real disk. | You patch the machine and set up backups yourself. |
-| A container platform with persistent volumes (for example Fly.io, Render, Railway) | Good, if the volume is persistent and you run one instance. | Attaching a volume usually ties the app to one machine or region; confirm that the plan you choose includes persistent storage. |
-| Serverless or static hosts (for example Vercel, Netlify, Cloudflare Workers) | Not suitable. | No long-running process and no persistent local disk for SQLite. |
+| **Render** (paid instance + persistent disk) | Good | Persistent disks attach only to paid services ("You can attach a persistent disk to a paid Render web service"). "You can't scale a service to multiple instances if it has a disk attached", and a disk "prevents zero-downtime deploys" (one instance is what Hushlist needs anyway). Disks get automatic daily snapshots. Render's load balancer terminates TLS and redirects HTTP to HTTPS. It builds from a Dockerfile. Your service must listen on `0.0.0.0`; Render's default port is 10000, so set `PORT=10000` or change the port in Render. (https://render.com/docs/disks, https://render.com/docs/web-services) |
+| **Render free instance** | Not suitable | "Free web services cannot" have persistent disks; their filesystem, including "local SQLite databases", is lost on every redeploy, restart or spin-down, and they spin down after 15 minutes without traffic. (https://render.com/docs/free) |
+| **Railway** (with a volume) | Good | Volumes give a service persistent storage; "Each service can only have a single volume" and "Replicas cannot be used with volumes"; there is "a small amount of downtime when re-deploying a service that has a volume attached". Railway builds from a Dockerfile at the root of the source directory. (https://docs.railway.com/volumes/reference, https://docs.railway.com/builds/dockerfiles) |
+| **Fly.io** (with a volume) | Probably good | Not verified: Fly's documentation moved to `docs.fly.io`, which I could not open. Check volumes, regions and backups there. |
+| **A small virtual machine** (any provider) with Docker and a TLS reverse proxy such as Caddy or nginx | Good | Full control, one process, a real disk. You patch the machine and run backups yourself. |
+| **Vercel** | Not suitable | Vercel "creates a new function invocation for each incoming request" and "scales your functions down to zero when there are no incoming requests" (https://vercel.com/docs/functions). Hushlist needs one long-running process for its timers and a persistent disk for its database. |
+
+Behind Render or Railway, set `HUSHLIST_TRUST_PROXY=1` only after confirming how that platform passes the client address; neither page I read states the header. Without it the app still works, but rate limits apply to the platform's proxy address rather than to each visitor.
 
 ## Before the first real user
 

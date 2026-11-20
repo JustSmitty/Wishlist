@@ -60,7 +60,7 @@ See [docs/DEPLOY.md](docs/DEPLOY.md): a `Dockerfile` is included, and the guide 
 ## Signing in
 
 - **Email code.** An 8-digit code is sent to the address. A browser where the person has signed in before is remembered (an `hl_device` cookie), and code requests from it are limited separately, so someone requesting codes for your address from elsewhere cannot lock you out of a browser you already use. Unknown browsers share tight per-address limits, including a daily cap on wrong guesses across all codes.
-- **Google.** With `HUSHLIST_GOOGLE_CLIENT_ID` and `HUSHLIST_GOOGLE_CLIENT_SECRET` set, "Sign in with Google" appears. The sign-in uses state bound to the browser, PKCE and a nonce, and Google's ID token is checked against Google's published keys. A Google account is matched to an existing Hushlist account by email only for `@gmail.com` and Google Workspace addresses, where Google controls the address; anyone else signs in with an email code once and then connects Google under Account settings.
+- **Google.** With `HUSHLIST_GOOGLE_CLIENT_ID` and `HUSHLIST_GOOGLE_CLIENT_SECRET` set, "Sign in with Google" appears. The sign-in uses state bound to the browser, PKCE and a nonce, and Google's ID token is checked as Google's OpenID Connect guide lists (signature against Google's published keys, issuer, audience, expiry), plus the nonce. Accounts are keyed on Google's `sub`. The first time, a Google account is matched to an existing Hushlist account by email only for Google Workspace addresses (the `hd` claim equals the address's domain) and `@gmail.com` addresses; the Gmail case is this app's judgement, not a rule Google documents. Anyone else signs in with an email code once and then connects Google under Account settings.
 
 ## What is not built yet
 
@@ -145,3 +145,5 @@ tests/                    node:test suites
 ## Third-party material
 
 The display typeface is Fraunces, copyright 2020 The Fraunces Project Authors, used under the SIL Open Font License 1.1. The full licence text, as shipped with the font, is in `src/public/fonts/OFL.txt`.
+
+The "Sign in with Google" button (`src/public/icons/google/signin-light-pill.svg`) is Google's own asset, unmodified, from the download bundle linked in Google's [Sign in with Google branding guidelines](https://developers.google.com/identity/branding-guidelines). Google's name and logo are Google's trademarks and are used as those guidelines describe.

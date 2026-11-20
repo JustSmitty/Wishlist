@@ -14,12 +14,19 @@
  *   and its issuer, audience, expiry and nonce are checked, even though it
  *   arrives straight from Google over TLS.
  *
- * Linking to an existing Hushlist account by email address happens only
- * when Google is the authority for that address: an @gmail.com address, or
- * a Google Workspace address (the token's `hd` claim names the address's
- * domain). For any other address Google has checked it once, but does not
- * control it; that person signs in with an email code first and then
- * connects Google from their account settings.
+ * Accounts are keyed on `sub`, as Google's OpenID Connect guide requires
+ * ("Don't use the email field as a unique identifier for a user. Always use
+ * the sub field."). The email address is used once, to find an existing
+ * Hushlist account the first time someone signs in with Google, and only
+ * where the address belongs to Google's own systems:
+ *   - a Google Workspace address: the guide says to use the `hd` claim, not
+ *     the email's domain, to identify Workspace users, so `hd` must be
+ *     present and equal to the address's domain;
+ *   - an @gmail.com address. Google's guide does not state this case. It is
+ *     this code's judgement that a Gmail address shown on a Google account
+ *     is that account's own mailbox.
+ * Anyone else signs in with an email code first and then connects Google
+ * from their account settings.
  */
 
 import crypto from 'node:crypto';

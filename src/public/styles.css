@@ -603,9 +603,10 @@ table.table { width: 100%; border-collapse: collapse; font-size: .88rem; backgro
   body { background: #fff; }
 }
 
-/* Sign in with Google: white button, dark text, the four-colour mark. */
-.btn--google { background: #fff; color: #1f1f1f; border-color: #747775; font-family: inherit; }
-.btn--google:hover { background: #f8f9fa; }
-.g-logo { width: 18px; height: 18px; flex: none; }
+/* Sign in with Google: Google's own button image, shown at its natural
+   proportions. Only the link around it is styled (focus ring). */
+.google-signin { display: inline-flex; align-self: center; border-radius: 999px; }
+.google-signin__img { display: block; width: 180px; height: 40px; }
+.google-signin:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
 .divider { display: flex; align-items: center; gap: .75rem; color: var(--ink-soft); font-size: .85rem; margin: .25rem 0; }
 .divider::before, .divider::after { content: ''; flex: 1; border-top: 1px solid var(--line); }

@@ -13,7 +13,7 @@ import gifts from './views/gifts.js';
 import circles from './views/circles.js';
 import inbox from './views/inbox.js';
 import admin from './views/admin.js';
-import welcome, { brandMark, G_LOGO } from './views/welcome.js';
+import welcome, { brandMark, GOOGLE_BUTTON } from './views/welcome.js';
 
 const NAV = [
   ['/', 'home', 'My lists', 'list'],
@@ -157,8 +157,8 @@ on('account', () => {
         ${me().google_connected
           ? html`<p class="small muted">You can sign in with Google. Disconnecting leaves your account as it is; you can still sign in with an email code.</p>
               <button class="btn btn--sm" type="button" data-action="google-disconnect">Disconnect Google</button>`
-          : html`<p class="small muted">Connect a Google account to sign in without waiting for a code.</p>
-              <a class="btn btn--sm btn--google" href="/api/auth/google/start?link=1">${G_LOGO}<span>Connect Google</span></a>`}` : ''}
+          : html`<p class="small muted">Connect a Google account so you can sign in with it next time, without waiting for a code.</p>
+              <a class="google-signin" href="/api/auth/google/start?link=1" aria-label="Connect your Google account: sign in with Google">${GOOGLE_BUTTON}</a>`}` : ''}
 
       <hr />
       <h3>Your data</h3>
